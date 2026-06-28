@@ -60,6 +60,7 @@ public sealed class Sgd : Optimizer
         foreach (var p in Parameters)
         {
             if (p.Grad == null) continue;
+            using var scope = Tensor.NewBufferScope(); // recycle this step's scratch buffers
             var g = p.Grad;
             if (_weightDecay != 0f) g = Add(g, Mul(p, Scalar(_weightDecay)));
 
@@ -70,7 +71,7 @@ public sealed class Sgd : Optimizer
                     buf = g.Clone(); // first step: buffer initialized to the gradient
                 else
                     buf = Add(Mul(buf, Scalar(_momentum)), Mul(g, Scalar(1f - _dampening)));
-                _buf[p] = buf;
+                _buf[p] = scope.Keep(buf); // momentum buffer persists across steps
                 g = _nesterov ? Add(g, Mul(buf, Scalar(_momentum))) : buf;
             }
 
@@ -97,6 +98,7 @@ public sealed class Adam : Optimizer
         foreach (var p in Parameters)
         {
             if (p.Grad == null) continue;
+            using var scope = Tensor.NewBufferScope(); // recycle this step's scratch buffers
             var g = p.Grad;
             if (_weightDecay != 0f) g = Add(g, Mul(p, Scalar(_weightDecay)));
 
@@ -105,7 +107,7 @@ public sealed class Adam : Optimizer
             int t = s.t + 1;
             var m = Add(Mul(s.m, Scalar(_b1)), Mul(g, Scalar(1f - _b1)));
             var v = Add(Mul(s.v, Scalar(_b2)), Mul(Square(g), Scalar(1f - _b2)));
-            _state[p] = (m, v, t);
+            _state[p] = (scope.Keep(m), scope.Keep(v), t); // moment estimates persist across steps
 
             float bc1 = 1f - MathF.Pow(_b1, t);
             float bc2 = 1f - MathF.Pow(_b2, t);
@@ -135,6 +137,7 @@ public sealed class AdamW : Optimizer
         foreach (var p in Parameters)
         {
             if (p.Grad == null) continue;
+            using var scope = Tensor.NewBufferScope(); // recycle this step's scratch buffers
             var g = p.Grad;
 
             // decoupled decay: p <- p * (1 - lr*wd) before the Adam step.
@@ -145,7 +148,7 @@ public sealed class AdamW : Optimizer
             int t = s.t + 1;
             var m = Add(Mul(s.m, Scalar(_b1)), Mul(g, Scalar(1f - _b1)));
             var v = Add(Mul(s.v, Scalar(_b2)), Mul(Square(g), Scalar(1f - _b2)));
-            _state[p] = (m, v, t);
+            _state[p] = (scope.Keep(m), scope.Keep(v), t); // moment estimates persist across steps
 
             float bc1 = 1f - MathF.Pow(_b1, t);
             float bc2 = 1f - MathF.Pow(_b2, t);
@@ -178,6 +181,7 @@ public sealed class RmsProp : Optimizer
         foreach (var p in Parameters)
         {
             if (p.Grad == null) continue;
+            using var scope = Tensor.NewBufferScope(); // recycle this step's scratch buffers
             var g = p.Grad;
             if (_weightDecay != 0f) g = Add(g, Mul(p, Scalar(_weightDecay)));
 
@@ -206,7 +210,10 @@ public sealed class RmsProp : Optimizer
             {
                 Update(p, Sub(p, Mul(Div(g, denom), Scalar(LearningRate))));
             }
-            _state[p] = (v, avg, buf);
+            // running stats persist across steps; the rest is scratch the scope reclaims
+            _state[p] = (scope.Keep(v),
+                         avg is null ? null : (Tensor?)scope.Keep(avg),
+                         buf is null ? null : (Tensor?)scope.Keep(buf));
         }
     });
 }

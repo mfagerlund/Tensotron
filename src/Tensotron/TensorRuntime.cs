@@ -173,8 +173,38 @@ public sealed class TensorRuntime : IDisposable
         return pick ?? ctx.GetPreferredDevice(preferCPU: false);
     }
 
+    // ---- float buffer pool ----
+    // Op outputs churn fast; allocating a fresh device buffer per op is a major cost,
+    // especially on backends where allocation is heavyweight. Rent reuses a same-length
+    // idle buffer if one is parked; Return parks it (under a budget) instead of freeing to
+    // the driver. Safe because every op fully overwrites its output (sparse/accumulating
+    // backward kernels allocate their target via Tensor.Zeros, which explicitly zero-fills),
+    // so a dirty reused buffer is never read before it is written. Single-threaded by the
+    // runtime's contract, so no locking. Pooled buffers stay reachable here, so ILGPU's own
+    // finalizer never frees them out from under us.
+    private const long PoolFloatBudget = 128L * 1024 * 1024; // ~512 MB of idle buffers
+    private readonly Dictionary<int, Stack<MemoryBuffer1D<float, Stride1D.Dense>>> _pool = new();
+    private long _pooledFloats;
+
     public MemoryBuffer1D<float, Stride1D.Dense> Allocate(int length)
-        => Accelerator.Allocate1D<float>(length);
+    {
+        if (length > 0 && _pool.TryGetValue(length, out var stack) && stack.Count > 0)
+        {
+            _pooledFloats -= length;
+            return stack.Pop();
+        }
+        return Accelerator.Allocate1D<float>(length);
+    }
+
+    /// <summary>Return an owned buffer to the pool for reuse (or free it if over budget).</summary>
+    public void Return(MemoryBuffer1D<float, Stride1D.Dense> buf)
+    {
+        int len = (int)buf.Length;
+        if (len <= 0 || _pooledFloats + len > PoolFloatBudget) { buf.Dispose(); return; }
+        if (!_pool.TryGetValue(len, out var stack)) _pool[len] = stack = new();
+        stack.Push(buf);
+        _pooledFloats += len;
+    }
 
     // ---- async batching ----
     // Kernels launch on the accelerator's in-order default stream and are NOT synced per
@@ -573,6 +603,11 @@ public sealed class TensorRuntime : IDisposable
 
     public void Dispose()
     {
+        foreach (var stack in _pool.Values)
+            foreach (var b in stack) b.Dispose();
+        _pool.Clear();
+        foreach (var b in _pendingInts) b.Dispose();
+        _pendingInts.Clear();
         Accelerator.Dispose();
         Context.Dispose();
     }

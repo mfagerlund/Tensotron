@@ -104,18 +104,57 @@ public sealed partial class Tensor : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        // Only the data buffer is freed, and only if owned. Grad is intentionally NOT disposed:
-        // gradients can be aliased across inputs (e.g. Add passes one upstream grad to both
-        // operands), so freeing here would risk a use-after-free. Grads are GC-reclaimed.
-        if (OwnsBuffer) Buffer.Dispose();
+        // The owned data buffer is returned to the runtime pool for reuse (not freed to the
+        // driver). Grad is intentionally NOT touched: gradients can be aliased across inputs
+        // (e.g. Add passes one upstream grad to both operands), so returning here would risk a
+        // use-after-free. Grads are GC-reclaimed.
+        if (OwnsBuffer) Runtime.Return(Buffer);
     }
 
     /// <summary>True if this tensor participates in gradient flow.</summary>
     internal static bool NeedsGrad(Tensor t) => t.RequiresGrad || t.Node != null;
 
+    // ---------------- allocation scope ----------------
+
+    [ThreadStatic] private static BufferScope? _activeScope;
+
+    /// <summary>
+    /// Open a scope that returns every tensor freshly <see cref="Allocate"/>d while it is open
+    /// to the buffer pool on dispose — except those passed to <see cref="BufferScope.Keep"/>.
+    /// Use around transient-heavy, no-grad blocks (e.g. an optimizer step) to recycle their
+    /// scratch buffers each iteration instead of leaving them for the GC. Do NOT use it around
+    /// autograd forward work whose intermediates a later Backward still needs.
+    /// </summary>
+    public static BufferScope NewBufferScope() => _activeScope = new BufferScope(_activeScope);
+
+    public sealed class BufferScope : IDisposable
+    {
+        private readonly BufferScope? _parent;
+        private readonly List<Tensor> _tracked = new();
+        private bool _disposed;
+        internal BufferScope(BufferScope? parent) => _parent = parent;
+        internal void Track(Tensor t) => _tracked.Add(t);
+
+        /// <summary>Exempt a tensor from this scope's cleanup so it survives (caller owns it).</summary>
+        public Tensor Keep(Tensor t) { _tracked.Remove(t); return t; }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _activeScope = _parent;
+            foreach (var t in _tracked) t.Dispose();
+        }
+    }
+
     // ---------------- creators ----------------
 
-    internal static Tensor Allocate(Shape shape) => new(shape, Runtime.Allocate(shape.Size));
+    internal static Tensor Allocate(Shape shape)
+    {
+        var t = new Tensor(shape, Runtime.Allocate(shape.Size));
+        _activeScope?.Track(t);
+        return t;
+    }
 
     public static Tensor FromArray(float[] data, params int[] dims)
     {
