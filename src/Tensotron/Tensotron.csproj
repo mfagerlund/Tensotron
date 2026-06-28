@@ -19,10 +19,17 @@
     <PackageTags>tensor;autograd;deep-learning;machine-learning;ilgpu;gpu;pytorch;neural-network</PackageTags>
   </PropertyGroup>
 
+  <!-- SPIKE (spike/ilgpu-velocity): reference ILGPU from local master source instead of NuGet
+       1.5.3, because the Velocity SIMD CPU accelerator exists only in master, not in any release.
+       Revert to the PackageReferences below to go back to NuGet. -->
   <ItemGroup>
+    <ProjectReference Include="..\..\..\ILGPU\Src\ILGPU\ILGPU.csproj" />
+    <ProjectReference Include="..\..\..\ILGPU\Src\ILGPU.Algorithms\ILGPU.Algorithms.csproj" />
+  </ItemGroup>
+  <!-- <ItemGroup>
     <PackageReference Include="ILGPU" Version="1.5.3" />
     <PackageReference Include="ILGPU.Algorithms" Version="1.5.3" />
-  </ItemGroup>
+  </ItemGroup> -->
 
   <!-- Pack the NuGet-facing readme as README.md (the dev README has repo-internal links/paths
        that read poorly on NuGet); ship the MIT license text too. -->

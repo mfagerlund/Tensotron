@@ -71,10 +71,12 @@ public sealed class ContinuousPpo
             float epReturnSum = 0f; int epCount = 0;
             var running = new float[E];
 
-            // ---- rollout (no autograd) ----
+            // ---- rollout: launch-free CPU inference from a one-shot weight snapshot ----
+            // (per-step device forwards would be hundreds of tiny launch+sync round-trips).
+            var cpu = _ac.SnapshotCpu();
             for (int t = 0; t < T; t++)
             {
-                var (means, values) = ForwardNoGrad(cur, E, S);
+                var (means, values) = ForwardCpu(cpu, cur, E);
                 for (int e = 0; e < E; e++)
                 {
                     int row = (t * E + e);
@@ -112,8 +114,8 @@ public sealed class ContinuousPpo
                 }
             }
 
-            // bootstrap value for the final state of each env
-            var (_, finalValues) = ForwardNoGrad(cur, E, S);
+            // bootstrap value for the final state of each env (same snapshot)
+            var (_, finalValues) = ForwardCpu(cpu, cur, E);
 
             // ---- GAE advantages + returns ----
             var adv = new float[B];
@@ -169,17 +171,21 @@ public sealed class ContinuousPpo
         }
     }
 
-    private (float[] means, float[] values) ForwardNoGrad(float[][] states, int E, int S)
+    // Launch-free rollout inference: evaluate the snapshotted policy+value on the host for E
+    // states. No tensors, no kernel launches, no Synchronize — the whole point of the split.
+    private static (float[] means, float[] values) ForwardCpu(CpuActorCritic cpu, float[][] states, int E)
     {
-        using (Tensor.NoGradScope())
+        int A = cpu.ActionSize;
+        var means = new float[E * A];
+        var values = new float[E];
+        var m = new float[A];
+        for (int e = 0; e < E; e++)
         {
-            var flat = new float[E * S];
-            for (int e = 0; e < E; e++) Array.Copy(states[e], 0, flat, e * S, S);
-            var st = Tensor.FromShaped(flat, new[] { E, S });
-            var means = _ac.PolicyMean(st).ToArray();
-            var values = _ac.Value(st).ToArray();
-            return (means, values);
+            cpu.Forward(states[e], m, out float v);
+            for (int k = 0; k < A; k++) means[e * A + k] = m[k];
+            values[e] = v;
         }
+        return (means, values);
     }
 
     private void UpdateMinibatch(int mb, int S, int A,
@@ -223,27 +229,24 @@ public sealed class ContinuousPpo
     /// of steps survived across the given number of episodes.</summary>
     public float EvaluateMeanSteps(int episodes, int maxSteps)
     {
-        using (Tensor.NoGradScope())
+        var cpu = _ac.SnapshotCpu();
+        var mean = new float[cpu.ActionSize];
+        float total = 0f;
+        for (int ep = 0; ep < episodes; ep++)
         {
-            int S = _ac.StateSize, A = _ac.ActionSize;
-            float total = 0f;
-            for (int ep = 0; ep < episodes; ep++)
+            var env = _envFactory();
+            var s = env.Reset();
+            int steps = 0;
+            for (; steps < maxSteps; steps++)
             {
-                var env = _envFactory();
-                var s = env.Reset();
-                int steps = 0;
-                for (; steps < maxSteps; steps++)
-                {
-                    var st = Tensor.FromShaped(s, new[] { 1, S });
-                    var mean = _ac.PolicyMean(st).ToArray();
-                    var (_, done) = env.Step(Math.Clamp(mean[0], -1f, 1f));
-                    s = env.GetState();
-                    if (done) { steps++; break; }
-                }
-                total += steps;
+                cpu.Forward(s, mean, out _);
+                var (_, done) = env.Step(Math.Clamp(mean[0], -1f, 1f));
+                s = env.GetState();
+                if (done) { steps++; break; }
             }
-            return total / episodes;
+            total += steps;
         }
+        return total / episodes;
     }
 
     private void Shuffle(int[] a)

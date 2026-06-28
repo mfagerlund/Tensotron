@@ -1,17 +1,18 @@
 using System.Collections.Concurrent;
 using ILGPU;
 using ILGPU.Runtime;
+using ILGPU.Runtime.Velocity; // .Velocity() context-builder extension (ILGPU master only)
 
 namespace Tensotron;
 
 /// <summary>
 /// Which ILGPU accelerator the runtime drives. <see cref="Auto"/> prefers a CUDA GPU and falls
-/// back to the CPU accelerator; <see cref="Cuda"/> / <see cref="Cpu"/> force one.
-/// NOTE: ILGPU (through 1.5.3, its latest) has no SIMD/vectorized CPU accelerator — <see cref="Cpu"/>
-/// is ILGPU's scalar CPUAccelerator. A fast SIMD CPU path, if ever added, would be a separate
-/// hand-written backend, not an ILGPU device.
+/// back to the CPU accelerator; <see cref="Cuda"/> / <see cref="Cpu"/> / <see cref="Velocity"/> force one.
+/// <see cref="Cpu"/> is ILGPU's scalar CPUAccelerator. <see cref="Velocity"/> is ILGPU's SIMD-vectorized
+/// CPU accelerator (128-bit lanes) — available only when building against ILGPU master source, since it
+/// ships in no released NuGet package (through 1.5.3).
 /// </summary>
-public enum TensorBackend { Auto, Cuda, Cpu }
+public enum TensorBackend { Auto, Cuda, Cpu, Velocity }
 
 /// <summary>
 /// Owns the single ILGPU Context + Accelerator and caches compiled kernels.
@@ -35,6 +36,7 @@ public sealed class TensorRuntime : IDisposable
         (Environment.GetEnvironmentVariable("TENSOTRON_BACKEND")?.Trim().ToLowerInvariant()) switch
         {
             "cuda" or "gpu" => TensorBackend.Cuda,
+            "velocity" or "simd" => TensorBackend.Velocity,
             "cpu" => TensorBackend.Cpu,
             _ => TensorBackend.Auto,
         };
@@ -88,8 +90,9 @@ public sealed class TensorRuntime : IDisposable
 
     private TensorRuntime()
     {
-        // Enable CPU + all GPUs (Default), then pick one device per the requested backend.
-        Context = Context.Create(b => b.Default().EnableAlgorithms());
+        // Enable CPU + all GPUs (Default) + the Velocity SIMD CPU device, then pick one device per
+        // the requested backend. (.Velocity() is a no-op on <64-bit and only present in master.)
+        Context = Context.Create(b => b.Default().Velocity().EnableAlgorithms());
         Accelerator = SelectDevice(Context, RequestedBackend).CreateAccelerator(Context);
 
         _addInto = Accelerator.LoadAutoGroupedStreamKernel<
@@ -164,13 +167,17 @@ public sealed class TensorRuntime : IDisposable
         Device? pick = backend switch
         {
             TensorBackend.Cuda => ctx.Devices.FirstOrDefault(d => d.AcceleratorType == AcceleratorType.Cuda),
+            TensorBackend.Velocity => ctx.Devices.FirstOrDefault(d => d.AcceleratorType == AcceleratorType.Velocity),
             TensorBackend.Cpu => ctx.Devices.FirstOrDefault(d => d.AcceleratorType == AcceleratorType.CPU),
-            _ => null, // Auto
+            // Auto: prefer a CUDA GPU, else the scalar CPU accelerator. Velocity is opt-in only — it
+            // must never be selected implicitly, so Auto stays identical to the pre-Velocity behavior.
+            _ => ctx.Devices.FirstOrDefault(d => d.AcceleratorType == AcceleratorType.Cuda)
+                 ?? ctx.Devices.FirstOrDefault(d => d.AcceleratorType == AcceleratorType.CPU),
         };
-        if (backend != TensorBackend.Auto && pick is null)
+        if (pick is null)
             throw new InvalidOperationException(
                 $"Requested backend {backend} but no matching ILGPU device is available.");
-        return pick ?? ctx.GetPreferredDevice(preferCPU: false);
+        return pick;
     }
 
     public MemoryBuffer1D<float, Stride1D.Dense> Allocate(int length)
