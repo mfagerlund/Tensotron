@@ -52,3 +52,23 @@ AdamW (decoupled-decay factor).
 rmsprop) green. The optimizer is now effectively free; **forward (6.2 ms) + backward (6.3 ms) now
 dominate.** Next targets: the `Linear` transpose-copy, per-launch stride-int uploads (the 52
 remaining host uploads), and the 88 allocs/step.
+
+### E2 — Content-cached stride/dim buffers (Tier 2) — *kept, huge & surprising win*
+
+`AllocInt` re-uploaded each op's shape/stride int arrays to the device **every launch** (a blocking
+`Allocate1D(int[])` host→device copy). These recur identically every step, so they are now cached by
+content (structural `int[]` key) and uploaded **once**. Data-dependent index arrays (gather/scatter
+indices, pool argmax) stay on the per-call parked-and-freed path so the cache can't grow unbounded.
+
+| Metric (default MLP) | After E1 | After E2 | Δ |
+|---|---|---|---|
+| **ms/step** | ~13.0 | **~2.0** (1.6–2.4) | **~6× faster** |
+| host uploads/step | 52 | **3** | −94% |
+| device allocs/step | 88 | 39 | −56% |
+| launches/step | 42 | 42 | — |
+| **test suite wall-clock** | ~48 s | **~3 s** | **~16×** |
+
+The ~49 eliminated host→device transfers/step were **blocking the async stream** — removing them gave
+another 5.5×, and incidentally sped the whole test suite ~16×. **Cumulative: 72.3 → ~2.0 ms/step,
+≈35×.** Correctness: 69/69 green. Variance is now GPU-clock jitter (absolute times are sub-millisecond
+per phase). Remaining per step: 42 launches, 39 allocs, 3 uploads — now genuinely compute/launch bound.

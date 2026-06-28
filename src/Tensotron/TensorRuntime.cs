@@ -13,6 +13,25 @@ namespace Tensotron;
 /// </summary>
 public enum TensorBackend { Auto, Cuda, Cpu }
 
+/// <summary>Structural equality/hash for int[] so shape/stride arrays can key a content cache.</summary>
+internal sealed class IntArrayComparer : IEqualityComparer<int[]>
+{
+    public bool Equals(int[]? a, int[]? b)
+    {
+        if (ReferenceEquals(a, b)) return true;
+        if (a is null || b is null || a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+        return true;
+    }
+
+    public int GetHashCode(int[] a)
+    {
+        var h = new HashCode();
+        foreach (var v in a) h.Add(v);
+        return h.ToHashCode();
+    }
+}
+
 /// <summary>
 /// Owns the single ILGPU Context + Accelerator and caches compiled kernels.
 /// One accelerator, kernels loaded once and cached. The backend is chosen once, at first use,
@@ -203,26 +222,36 @@ public sealed class TensorRuntime : IDisposable
     // ---- async batching ----
     // Kernels launch on the accelerator's in-order default stream and are NOT synced per
     // launch. The stream is drained (a) at every host pull (Sync, via ToArray/Item) and
-    // (b) every FlushEvery launches as a safety valve, so the queue and the parked
-    // stride-buffer arena stay bounded. The small int stride/dim buffers a launch uploads
-    // must outlive the now-async kernel, so they are parked in _pendingInts and freed only
-    // when the stream is drained — never with `using` at the call site.
+    // (b) every FlushEvery launches as a safety valve to bound the in-flight queue.
     private const int FlushEvery = 64;
-    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _pendingInts = new();
     private int _opsSinceSync;
+
+    // Read-only shape/stride/config int buffers recur IDENTICALLY every step (the model's
+    // shapes are fixed), so they are cached by content and uploaded to the device exactly
+    // once — not re-uploaded and freed per launch. Bounded in practice by the number of
+    // distinct shapes the model touches. Data-dependent index arrays (gather/scatter idx,
+    // pool argmax) are NOT cached (their contents vary per step, which would grow the cache
+    // unbounded); those use the parked-and-freed path below.
+    private readonly Dictionary<int[], MemoryBuffer1D<int, Stride1D.Dense>> _intCache =
+        new(new IntArrayComparer());
+    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _pendingInts = new();
 
     // Index/stride buffers: never allocate length 0 (rank-0 tensors) — ILGPU NREs on
     // a zero-length view. The kernels take an explicit `rank`, so padded content is unused.
-    private MemoryBuffer1D<int, Stride1D.Dense> AllocInt(int[] a)
+    // cache=true: recurring shape metadata (cached). cache=false: per-call data-dependent
+    // indices (parked, freed on the next drain so they outlive the async kernel).
+    private MemoryBuffer1D<int, Stride1D.Dense> AllocInt(int[] a, bool cache = true)
     {
+        if (cache && _intCache.TryGetValue(a, out var hit)) return hit;
         Allocs++;
         HostUploads++;
         var buf = Accelerator.Allocate1D(a.Length == 0 ? new[] { 0 } : a);
-        _pendingInts.Add(buf);
+        if (cache) _intCache[(int[])a.Clone()] = buf;
+        else _pendingInts.Add(buf);
         return buf;
     }
 
-    // Called after every async launch: drain + free parked buffers once enough work queues.
+    // Called after every async launch: periodic drain to bound the in-flight queue.
     private void AfterLaunch()
     {
         Launches++;
@@ -487,7 +516,7 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> outp,
         int[] index, int[] outDims, int[] xStrides, int axis, int mode)
     {
-        var dIdx = AllocInt(index);
+        var dIdx = AllocInt(index, cache: false); // data-dependent
         var dOut = AllocInt(outDims);
         var dStr = AllocInt(xStrides);
         _gatherAxis((int)outp.Length, outDims.Length, x.View, outp.View,
@@ -500,7 +529,7 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> gx,
         int[] index, int[] srcDims, int[] dstStrides, int axis, int mode)
     {
-        var dIdx = AllocInt(index);
+        var dIdx = AllocInt(index, cache: false); // data-dependent
         var dSrc = AllocInt(srcDims);
         var dDst = AllocInt(dstStrides);
         _scatterAddAxis((int)g.Length, srcDims.Length, g.View, gx.View,
@@ -573,7 +602,7 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> gx,
         int[] argmax)
     {
-        var dArg = AllocInt(argmax);
+        var dArg = AllocInt(argmax, cache: false); // data-dependent
         _maxPool2dGrad((int)g.Length, g.View, gx.View, dArg.View);
         AfterLaunch();
     }
@@ -627,6 +656,10 @@ public sealed class TensorRuntime : IDisposable
 
     public void Dispose()
     {
+        foreach (var b in _intCache.Values) b.Dispose();
+        _intCache.Clear();
+        foreach (var b in _pendingInts) b.Dispose();
+        _pendingInts.Clear();
         Accelerator.Dispose();
         Context.Dispose();
     }
