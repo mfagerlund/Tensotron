@@ -196,7 +196,7 @@ public sealed partial class Tensor : IDisposable
     internal Tensor Clone()
     {
         var t = Allocate(Shape);
-        t.Buffer.CopyFromCPU(ToArray());
+        Runtime.DeviceCopy(Buffer, t.Buffer); // device→device, no host round-trip
         return t;
     }
 
@@ -206,7 +206,15 @@ public sealed partial class Tensor : IDisposable
     {
         if (!src.Shape.Equals(Shape))
             throw new InvalidOperationException($"CopyInPlace shape {src.Shape} != {Shape}.");
-        Buffer.CopyFromCPU(src.ToArray());
+        Runtime.DeviceCopy(src.Buffer, Buffer); // device→device, no host round-trip
+    }
+
+    // CPU-sourced in-place overwrite (host data → this buffer), e.g. weight init / deserialize.
+    internal void CopyFromHost(float[] data)
+    {
+        if (data.Length != Shape.Size)
+            throw new InvalidOperationException($"CopyFromHost length {data.Length} != {Shape.Size} {Shape}.");
+        Buffer.CopyFromCPU(data);
     }
 
     /// <summary>In-place copy of another tensor's data into this one (torch's <c>copy_</c>).</summary>

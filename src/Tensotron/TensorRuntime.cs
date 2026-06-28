@@ -176,12 +176,52 @@ public sealed class TensorRuntime : IDisposable
     public MemoryBuffer1D<float, Stride1D.Dense> Allocate(int length)
         => Accelerator.Allocate1D<float>(length);
 
+    // ---- async batching ----
+    // Kernels launch on the accelerator's in-order default stream and are NOT synced per
+    // launch. The stream is drained (a) at every host pull (Sync, via ToArray/Item) and
+    // (b) every FlushEvery launches as a safety valve, so the queue and the parked
+    // stride-buffer arena stay bounded. The small int stride/dim buffers a launch uploads
+    // must outlive the now-async kernel, so they are parked in _pendingInts and freed only
+    // when the stream is drained — never with `using` at the call site.
+    private const int FlushEvery = 64;
+    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _pendingInts = new();
+    private int _opsSinceSync;
+
     // Index/stride buffers: never allocate length 0 (rank-0 tensors) — ILGPU NREs on
     // a zero-length view. The kernels take an explicit `rank`, so padded content is unused.
     private MemoryBuffer1D<int, Stride1D.Dense> AllocInt(int[] a)
-        => Accelerator.Allocate1D(a.Length == 0 ? new[] { 0 } : a);
+    {
+        var buf = Accelerator.Allocate1D(a.Length == 0 ? new[] { 0 } : a);
+        _pendingInts.Add(buf);
+        return buf;
+    }
 
-    public void Sync() => Accelerator.Synchronize();
+    // Called after every async launch: drain + free parked buffers once enough work queues.
+    private void AfterLaunch()
+    {
+        if (++_opsSinceSync >= FlushEvery) Drain();
+    }
+
+    private void Drain()
+    {
+        Accelerator.Synchronize();
+        foreach (var b in _pendingInts) b.Dispose();
+        _pendingInts.Clear();
+        _opsSinceSync = 0;
+    }
+
+    /// <summary>Drain the default stream and free parked stride buffers. The single sync
+    /// point — host pulls (ToArray/Item) call it before reading device memory.</summary>
+    public void Sync() => Drain();
+
+    /// <summary>Stream-ordered device→device copy (no host round-trip). Used by in-place
+    /// parameter updates and Clone, which previously bounced through host memory.</summary>
+    public void DeviceCopy(MemoryBuffer1D<float, Stride1D.Dense> src,
+                           MemoryBuffer1D<float, Stride1D.Dense> dst)
+    {
+        src.View.CopyTo(Accelerator.DefaultStream, dst.View);
+        AfterLaunch();
+    }
 
     private Action<Index1D, int, ArrayView<float>, ArrayView<float>, ArrayView<float>,
         ArrayView<int>, ArrayView<int>, ArrayView<int>> GetBinaryKernel<TOp>()
@@ -206,11 +246,11 @@ public sealed class TensorRuntime : IDisposable
         where TOp : struct, IBinaryOp
     {
         var kernel = GetBinaryKernel<TOp>();
-        using var dOut = AllocInt(outDims);
-        using var dA = AllocInt(aStride);
-        using var dB = AllocInt(bStride);
+        var dOut = AllocInt(outDims);
+        var dA = AllocInt(aStride);
+        var dB = AllocInt(bStride);
         kernel((int)outv.Length, outDims.Length, a.View, b.View, outv.View, dOut.View, dA.View, dB.View);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchUnaryFwd<TOp>(
@@ -223,7 +263,7 @@ public sealed class TensorRuntime : IDisposable
                 Accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(
                     Kernels.UnaryFwd<TOp>));
         kernel((int)outv.Length, x.View, outv.View);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchUnaryBwd<TOp>(
@@ -239,7 +279,7 @@ public sealed class TensorRuntime : IDisposable
                     Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>>(
                     Kernels.UnaryBwd<TOp>));
         kernel((int)gx.Length, x.View, y.View, gy.View, gx.View);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchUnaryFwdP<TOp>(
@@ -253,7 +293,7 @@ public sealed class TensorRuntime : IDisposable
                 Accelerator.LoadAutoGroupedStreamKernel<Index1D, TOp, ArrayView<float>, ArrayView<float>>(
                     Kernels.UnaryFwdP<TOp>));
         kernel((int)outv.Length, op, x.View, outv.View);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchUnaryBwdP<TOp>(
@@ -270,7 +310,7 @@ public sealed class TensorRuntime : IDisposable
                     Index1D, TOp, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>>(
                     Kernels.UnaryBwdP<TOp>));
         kernel((int)gx.Length, op, x.View, y.View, gy.View, gx.View);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchAddInto(
@@ -278,7 +318,7 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> source)
     {
         _addInto((int)target.Length, target.View, source.View);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchReduceSum(
@@ -286,13 +326,13 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> outp,
         int[] inDims, int[] inStrides, int[] outDims, int[] reduceMask)
     {
-        using var dInDims = AllocInt(inDims);
-        using var dInStrides = AllocInt(inStrides);
-        using var dOutDims = AllocInt(outDims);
-        using var dMask = AllocInt(reduceMask);
+        var dInDims = AllocInt(inDims);
+        var dInStrides = AllocInt(inStrides);
+        var dOutDims = AllocInt(outDims);
+        var dMask = AllocInt(reduceMask);
         _reduceSum((int)outp.Length, inDims.Length, inp.View, outp.View,
             dInDims.View, dInStrides.View, dOutDims.View, dMask.View);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchReduce<TR>(
@@ -308,13 +348,13 @@ public sealed class TensorRuntime : IDisposable
                     Index1D, int, ArrayView<float>, ArrayView<float>,
                     ArrayView<int>, ArrayView<int>, ArrayView<int>, ArrayView<int>>(Kernels.Reduce<TR>));
 
-        using var dInDims = AllocInt(inDims);
-        using var dInStrides = AllocInt(inStrides);
-        using var dOutDims = AllocInt(outDims);
-        using var dMask = AllocInt(reduceMask);
+        var dInDims = AllocInt(inDims);
+        var dInStrides = AllocInt(inStrides);
+        var dOutDims = AllocInt(outDims);
+        var dMask = AllocInt(reduceMask);
         kernel((int)outp.Length, inDims.Length, inp.View, outp.View,
             dInDims.View, dInStrides.View, dOutDims.View, dMask.View);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchReduceArg(
@@ -322,13 +362,13 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> outIdx,
         int[] inDims, int[] inStrides, int[] outDims, int[] reduceMask, bool isMax)
     {
-        using var dInDims = AllocInt(inDims);
-        using var dInStrides = AllocInt(inStrides);
-        using var dOutDims = AllocInt(outDims);
-        using var dMask = AllocInt(reduceMask);
+        var dInDims = AllocInt(inDims);
+        var dInStrides = AllocInt(inStrides);
+        var dOutDims = AllocInt(outDims);
+        var dMask = AllocInt(reduceMask);
         _reduceArg((int)outIdx.Length, inDims.Length, inp.View, outIdx.View,
             dInDims.View, dInStrides.View, dOutDims.View, dMask.View, isMax ? 1 : 0);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchMatMul(
@@ -339,7 +379,7 @@ public sealed class TensorRuntime : IDisposable
         int aMs, int aKs, int bKs, int bNs)
     {
         _matmul(M * N, a.View, b.View, c.View, M, N, K, aMs, aKs, bKs, bNs);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchReduceArgGrad(
@@ -348,13 +388,13 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> gx,
         int[] inDims, int[] inStrides, int[] outDims, int[] reduceMask, bool isMax)
     {
-        using var dInDims = AllocInt(inDims);
-        using var dInStrides = AllocInt(inStrides);
-        using var dOutDims = AllocInt(outDims);
-        using var dMask = AllocInt(reduceMask);
+        var dInDims = AllocInt(inDims);
+        var dInStrides = AllocInt(inStrides);
+        var dOutDims = AllocInt(outDims);
+        var dMask = AllocInt(reduceMask);
         _reduceArgGrad((int)gout.Length, inDims.Length, inp.View, gout.View, gx.View,
             dInDims.View, dInStrides.View, dOutDims.View, dMask.View, isMax ? 1 : 0);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchProdGrad(
@@ -363,13 +403,13 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> gx,
         int[] inDims, int[] inStrides, int[] outStrides, int[] reduceMask)
     {
-        using var dInDims = AllocInt(inDims);
-        using var dInStrides = AllocInt(inStrides);
-        using var dOutStrides = AllocInt(outStrides);
-        using var dMask = AllocInt(reduceMask);
+        var dInDims = AllocInt(inDims);
+        var dInStrides = AllocInt(inStrides);
+        var dOutStrides = AllocInt(outStrides);
+        var dMask = AllocInt(reduceMask);
         _prodGrad((int)inp.Length, inDims.Length, inp.View, gout.View, gx.View,
             dInDims.View, dInStrides.View, dOutStrides.View, dMask.View);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchStridedCopy(
@@ -377,10 +417,10 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> outp,
         int[] outDims, int[] inStrides, int baseOff = 0)
     {
-        using var dOut = AllocInt(outDims);
-        using var dIn = AllocInt(inStrides);
+        var dOut = AllocInt(outDims);
+        var dIn = AllocInt(inStrides);
         _stridedCopy((int)outp.Length, outDims.Length, inp.View, outp.View, dOut.View, dIn.View, baseOff);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchScatterAxisRange(
@@ -388,11 +428,11 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> dst,
         int[] srcDims, int[] dstStrides, int axis, int axisOffset)
     {
-        using var dSrc = AllocInt(srcDims);
-        using var dDst = AllocInt(dstStrides);
+        var dSrc = AllocInt(srcDims);
+        var dDst = AllocInt(dstStrides);
         _scatterAxisRange((int)src.Length, srcDims.Length, src.View, dst.View,
             dSrc.View, dDst.View, axis, axisOffset);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchMatMulBatched(
@@ -403,13 +443,13 @@ public sealed class TensorRuntime : IDisposable
         int aMs, int aKs, int bKs, int bNs,
         int[] batchDims, int[] aBatchStrides, int[] bBatchStrides)
     {
-        using var dBd = AllocInt(batchDims);
-        using var dAbs = AllocInt(aBatchStrides);
-        using var dBbs = AllocInt(bBatchStrides);
+        var dBd = AllocInt(batchDims);
+        var dAbs = AllocInt(aBatchStrides);
+        var dBbs = AllocInt(bBatchStrides);
         _matmulBatched(batchCount * M * N, a.View, b.View, c.View,
             batchDims.Length, M, N, K, aMs, aKs, bKs, bNs,
             dBd.View, dAbs.View, dBbs.View);
-        Sync();
+        AfterLaunch();
     }
 
     // index/gather family. The index host array is uploaded per launch (same
@@ -420,12 +460,12 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> outp,
         int[] index, int[] outDims, int[] xStrides, int axis, int mode)
     {
-        using var dIdx = AllocInt(index);
-        using var dOut = AllocInt(outDims);
-        using var dStr = AllocInt(xStrides);
+        var dIdx = AllocInt(index);
+        var dOut = AllocInt(outDims);
+        var dStr = AllocInt(xStrides);
         _gatherAxis((int)outp.Length, outDims.Length, x.View, outp.View,
             dIdx.View, dOut.View, dStr.View, axis, mode);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchScatterAddAxis(
@@ -433,12 +473,12 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> gx,
         int[] index, int[] srcDims, int[] dstStrides, int axis, int mode)
     {
-        using var dIdx = AllocInt(index);
-        using var dSrc = AllocInt(srcDims);
-        using var dDst = AllocInt(dstStrides);
+        var dIdx = AllocInt(index);
+        var dSrc = AllocInt(srcDims);
+        var dDst = AllocInt(dstStrides);
         _scatterAddAxis((int)g.Length, srcDims.Length, g.View, gx.View,
             dIdx.View, dSrc.View, dDst.View, axis, mode);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchRepeat(
@@ -446,12 +486,12 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> outp,
         int[] outDims, int[] inDims, int[] inStrides)
     {
-        using var dOut = AllocInt(outDims);
-        using var dInD = AllocInt(inDims);
-        using var dInS = AllocInt(inStrides);
+        var dOut = AllocInt(outDims);
+        var dInD = AllocInt(inDims);
+        var dInS = AllocInt(inStrides);
         _repeat((int)outp.Length, outDims.Length, x.View, outp.View,
             dOut.View, dInD.View, dInS.View);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchRepeatGrad(
@@ -459,12 +499,12 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> gx,
         int[] outDims, int[] inDims, int[] inStrides)
     {
-        using var dOut = AllocInt(outDims);
-        using var dInD = AllocInt(inDims);
-        using var dInS = AllocInt(inStrides);
+        var dOut = AllocInt(outDims);
+        var dInD = AllocInt(inDims);
+        var dInS = AllocInt(inStrides);
         _repeatGrad((int)g.Length, outDims.Length, g.View, gx.View,
             dOut.View, dInD.View, dInS.View);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchIm2Col(
@@ -472,9 +512,9 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> col,
         int[] cfg)
     {
-        using var dCfg = AllocInt(cfg);
+        var dCfg = AllocInt(cfg);
         _im2col((int)col.Length, x.View, col.View, dCfg.View);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchCol2Im(
@@ -482,9 +522,9 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> gx,
         int[] cfg)
     {
-        using var dCfg = AllocInt(cfg);
+        var dCfg = AllocInt(cfg);
         _col2im((int)gcol.Length, gcol.View, gx.View, dCfg.View);
-        Sync();
+        AfterLaunch();
     }
 
     // MaxPool forward returns the per-output argmax (flat input offsets) downloaded to the
@@ -494,10 +534,10 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> outp,
         int[] cfg)
     {
-        using var dCfg = AllocInt(cfg);
+        var dCfg = AllocInt(cfg);
         using var dArg = Accelerator.Allocate1D<int>(outp.Length);
         _maxPool2d((int)outp.Length, x.View, outp.View, dArg.View, dCfg.View);
-        Sync();
+        Sync(); // host readback of the argmax indices below: drain before reading
         return dArg.GetAsArray1D();
     }
 
@@ -506,9 +546,9 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> gx,
         int[] argmax)
     {
-        using var dArg = AllocInt(argmax);
+        var dArg = AllocInt(argmax);
         _maxPool2dGrad((int)g.Length, g.View, gx.View, dArg.View);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchAvgPool2d(
@@ -516,9 +556,9 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> outp,
         int[] cfg)
     {
-        using var dCfg = AllocInt(cfg);
+        var dCfg = AllocInt(cfg);
         _avgPool2d((int)outp.Length, x.View, outp.View, dCfg.View);
-        Sync();
+        AfterLaunch();
     }
 
     public void LaunchAvgPool2dGrad(
@@ -526,9 +566,9 @@ public sealed class TensorRuntime : IDisposable
         MemoryBuffer1D<float, Stride1D.Dense> gx,
         int[] cfg)
     {
-        using var dCfg = AllocInt(cfg);
+        var dCfg = AllocInt(cfg);
         _avgPool2dGrad((int)g.Length, g.View, gx.View, dCfg.View);
-        Sync();
+        AfterLaunch();
     }
 
     public void Dispose()

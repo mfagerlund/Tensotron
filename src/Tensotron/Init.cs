@@ -72,7 +72,7 @@ public static class Init
     {
         var data = new float[t.Shape.Size];
         for (int i = 0; i < data.Length; i++) data[i] = low + (high - low) * (float)_rng.NextDouble();
-        t.CopyInPlace(Tensor.FromShaped(data, t.Shape.Dims));
+        t.CopyFromHost(data);
         return t;
     }
 
@@ -80,7 +80,7 @@ public static class Init
     {
         var data = new float[t.Shape.Size];
         for (int i = 0; i < data.Length; i++) data[i] = mean + std * NextGaussian();
-        t.CopyInPlace(Tensor.FromShaped(data, t.Shape.Dims));
+        t.CopyFromHost(data);
         return t;
     }
 
