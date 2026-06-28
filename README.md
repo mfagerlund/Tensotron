@@ -17,6 +17,37 @@ y.Backward();
 // x.Grad == [2, 4, 6]
 ```
 
+And a complete training loop is the same shape you'd expect from PyTorch:
+
+```csharp
+var model = new Sequential(
+    new Linear(2, 64), Activation.Relu(),
+    new Linear(64, 3));
+var opt = new Adam(model.Parameters().ToList(), lr: 1e-2f);
+
+for (int epoch = 0; epoch < 1000; epoch++)
+{
+    var loss = TensorOps.CrossEntropy(model.Forward(x), labels);
+    opt.ZeroGrad();
+    loss.Backward();
+    opt.Step();
+}
+```
+
+### Runnable examples
+
+`examples/Tensotron.Examples` is a console app with three from-scratch demos — start here:
+
+```
+dotnet run --project examples/Tensotron.Examples            # runs all three
+dotnet run --project examples/Tensotron.Examples xor        # smallest training loop
+dotnet run --project examples/Tensotron.Examples spiral     # 3-class spiral → spiral.svg
+dotnet run --project examples/Tensotron.Examples regression # noisy sine fit → regression.svg
+```
+
+No GPU needed (CPU-accelerator fallback). The spiral and regression demos write an SVG you
+can open in a browser. See [examples/README.md](examples/README.md).
+
 ## Design
 
 ### Define-by-run forward graph

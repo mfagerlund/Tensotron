@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Tensotron.Examples — minimal, runnable getting-started programs.
+
+    Unlike Tensotron.Showcase (xUnit tests that assert learning), this is a plain
+    console app you can run with `dotnet run` to watch a model train from scratch and
+    drop an SVG you can open in a browser. Start here if you're new to the library.
+    Pass an example name (xor, spiral, regression) as an argument, or none to run all.
+    See examples/README.md for the exact commands.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>Tensotron.Examples</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Tensotron\Tensotron.csproj" />
+  </ItemGroup>
+
+</Project>

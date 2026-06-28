@@ -5,3 +5,7 @@ obj/
 .idea/
 __pycache__/
 *.pyc
+
+# Example/showcase render outputs written to the working dir
+/spiral.svg
+/regression.svg
