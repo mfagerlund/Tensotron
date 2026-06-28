@@ -37,13 +37,13 @@ public static class RegressionExample
             new Linear(64, 1));
         var opt = new Adam(model.Parameters().ToList(), lr: 5e-3f);
 
-        for (int step = 1; step <= 3000; step++)
+        for (int step = 1; step <= 1200; step++)
         {
             var loss = TensorOps.MseLoss(model.Forward(x), target);
             opt.ZeroGrad();
             loss.Backward();
             opt.Step();
-            if (step % 500 == 0) Console.WriteLine($"  step {step,4}: mse={loss.Item():0.0000}");
+            if (step % 300 == 0) Console.WriteLine($"  step {step,4}: mse={loss.Item():0.0000}");
         }
 
         RenderSvg(model, xs, ys, "regression.svg");

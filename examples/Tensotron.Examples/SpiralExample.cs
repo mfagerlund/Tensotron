@@ -32,13 +32,13 @@ public static class SpiralExample
             new Linear(64, Classes));
         var opt = new Adam(model.Parameters().ToList(), lr: 1e-2f, weightDecay: 1e-4f);
 
-        for (int epoch = 1; epoch <= 1500; epoch++)
+        for (int epoch = 1; epoch <= 400; epoch++)
         {
             var loss = TensorOps.CrossEntropy(model.Forward(x), labels);
             opt.ZeroGrad();
             loss.Backward();
             opt.Step();
-            if (epoch % 250 == 0)
+            if (epoch % 100 == 0)
                 Console.WriteLine($"  epoch {epoch,4}: loss={loss.Item():0.0000}, acc={Accuracy(model, x, labels):0.000}");
         }
 
