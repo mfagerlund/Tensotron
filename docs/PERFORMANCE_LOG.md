@@ -127,3 +127,31 @@ forward + both grads against the old `MatMul(x, W.T())` path at a small (naive) 
 
 Removed exactly the 6 expected launches (3 forward copies + 3 backward permutes) and a weight-sized
 copy per layer per direction (more bandwidth saved as width grows). **72/72 tests green.**
+
+### E5 — cuBLAS SGEMM on CUDA (Tier 3) — *kept, decisive on large nets*
+
+Wired ILGPU.Algorithms' `CuBlas` (vendor-tuned SGEMM) into `LaunchMatMul` for the compute-bound
+regime on the CUDA backend; the tiled kernel stays as the CPU path, naive for small/skinny products.
+The hard part is that cuBLAS is **column-major** while our buffers are row-major and operands can be
+stride-transposed (backward) — solved with the operand-swap identity (compute Cᵀ=Bᵀ·Aᵀ; cuBLAS-A=our B,
+cuBLAS-B=our A; m=N,n=M,k=K) and a per-operand trans-flag/leading-dim derived from the strides
+(`contraction-contiguous ⇒ NonTranspose`). cuBLAS shares the accelerator default stream, so it
+interleaves in-order with our kernels under the same single `Sync`. **Verified** by the existing
+large-matmul tests (forward + dA + dB exercise all three stride patterns vs a CPU reference) — passed
+on the first try.
+
+Full sweep, **naive → tiled → cuBLAS** ms/step:
+
+| batch × width | naive | tiled | cuBLAS | cuBLAS vs naive |
+|---|---|---|---|---|
+| 1024 × 512 | 7.11 | 4.43 | 2.67 | 2.7× |
+| 4096 × 512 | 15.58 | 9.90 | 7.26 | 2.1× |
+| 256 × 2048 | 16.08 | 9.00 | 2.77 | 5.8× |
+| **1024 × 2048** | 46.24 | 14.79 | **4.43** | **10.4×** |
+
+Small nets also improved (launch floor now **~0.7–0.9 ms**; 64×512 = 0.72). **72/72 tests green.**
+
+**Anomaly → next experiment.** `4096 × 2048` = **196.9 ms** — wildly super-linear (4× the batch of the
+4.43 ms row → 44× the time). cuBLAS is fast here; the cost is the **allocator**: 4096×2048 activations
+are ~33 MB each, ×33 allocs/step ≈ 1 GB of `cudaMalloc`/free churn per step. This is the remaining
+bottleneck for large-activation training and motivates E6 (caching allocator).

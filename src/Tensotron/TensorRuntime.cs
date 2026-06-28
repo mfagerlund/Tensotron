@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using ILGPU;
 using ILGPU.Runtime;
+using ILGPU.Runtime.Cuda;
 
 namespace Tensotron;
 
@@ -62,6 +63,11 @@ public sealed class TensorRuntime : IDisposable
     public Accelerator Accelerator { get; }
     public string DeviceName => Accelerator.Name;
     public bool IsGpu => Accelerator.AcceleratorType != AcceleratorType.CPU;
+
+    // cuBLAS GEMM handle — only on the CUDA backend (null on CPU). Shares the accelerator's
+    // default stream, so its launches interleave in-order with our kernels and the single Sync.
+    private readonly CuBlas? _blas;
+    public bool UsesCuBlas => _blas != null;
 
     // Non-generic kernels: loaded once into fields.
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _addInto;
@@ -193,6 +199,11 @@ public sealed class TensorRuntime : IDisposable
         _sgdStep = Accelerator.LoadAutoGroupedStreamKernel<
             Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
             float, float, float, float, float, float>(Kernels.SgdStep);
+
+        // cuBLAS for the compute-bound matmul regime (vendor-tuned SGEMM). CUDA only; the
+        // tiled/naive kernels remain the CPU path and the small-matmul path.
+        if (Accelerator is CudaAccelerator cuda)
+            _blas = new CuBlas(cuda) { PointerMode = CuBlasPointerMode.Host };
     }
 
     private static Device SelectDevice(Context ctx, TensorBackend backend)
@@ -440,10 +451,16 @@ public sealed class TensorRuntime : IDisposable
         int M, int N, int K,
         int aMs, int aKs, int bKs, int bNs)
     {
-        // Tiled shared-memory GEMM for the compute-bound regime; the naive one-thread-per-output
-        // kernel for small/skinny products where tiling's masked threads aren't worth it.
+        // Compute-bound regime: cuBLAS SGEMM on CUDA (vendor-tuned), else the tiled shared-memory
+        // kernel. Small/skinny products use the naive one-thread-per-output kernel (tiling/cuBLAS
+        // launch overhead isn't worth it there).
         const int TS = Kernels.MatMulTile;
-        if (M >= 64 && N >= 64 && K >= 64)
+        bool large = M >= 64 && N >= 64 && K >= 64;
+        if (large && _blas != null)
+        {
+            CuBlasGemm(a, b, c, M, N, K, aMs, aKs, bKs, bNs);
+        }
+        else if (large)
         {
             var grid = new Index3D((N + TS - 1) / TS, (M + TS - 1) / TS, 1);
             var group = new Index3D(TS, TS, 1);
@@ -454,6 +471,26 @@ public sealed class TensorRuntime : IDisposable
             _matmul(M * N, a.View, b.View, c.View, M, N, K, aMs, aKs, bKs, bNs);
         }
         AfterLaunch();
+    }
+
+    // Map our row-major strided matmul to one column-major cuBLAS SGEMM. cuBLAS computes a
+    // column-major product; a row-major (R,C) buffer is bit-identical to a column-major (C,R), so
+    // we compute Cᵀ = Bᵀ·Aᵀ by swapping operands (cuBLAS-A = our B, cuBLAS-B = our A) with
+    // m=N,n=M,k=K and ldc=N. Each operand is a contiguous matrix read either normally (contraction
+    // stride 1) or transposed (output-dim stride 1); that maps to the trans flag + leading dim.
+    private void CuBlasGemm(
+        MemoryBuffer1D<float, Stride1D.Dense> a,
+        MemoryBuffer1D<float, Stride1D.Dense> b,
+        MemoryBuffer1D<float, Stride1D.Dense> c,
+        int M, int N, int K, int aMs, int aKs, int bKs, int bNs)
+    {
+        bool aNormal = aKs == 1;   // our A is row-major (M,K)            (else stored Aᵀ: K×M)
+        bool bNormal = bNs == 1;   // our B is row-major (K,N)            (else stored Bᵀ: N×K)
+        var transA = bNormal ? CuBlasOperation.NonTranspose : CuBlasOperation.Transpose; // cuBLAS-A = our B
+        int ldA = bNormal ? N : K;
+        var transB = aNormal ? CuBlasOperation.NonTranspose : CuBlasOperation.Transpose; // cuBLAS-B = our A
+        int ldB = aNormal ? K : M;
+        _blas!.Gemm(transA, transB, N, M, K, 1f, b.View, ldA, a.View, ldB, 0f, c.View, N);
     }
 
     public void LaunchReduceArgGrad(
@@ -674,6 +711,7 @@ public sealed class TensorRuntime : IDisposable
 
     public void Dispose()
     {
+        _blas?.Dispose();
         foreach (var b in _intCache.Values) b.Dispose();
         _intCache.Clear();
         foreach (var b in _pendingInts) b.Dispose();
