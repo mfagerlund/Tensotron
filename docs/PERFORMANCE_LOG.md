@@ -180,3 +180,54 @@ specifically for **large activations / large batch**. (Gradient buffers are *not
 alias across inputs — so pool-on still shows 22 allocs/step; recycling those too needs ref-counting,
 left as future work.) **Correctness:** new `AllocatorPoolTests` trains the same net with and without
 recycling and requires **bit-identical** parameters; 74/74 tests green.
+
+---
+
+## Conclusions
+
+**Headline (default MLP `32→128→128→1`, batch 256, RTX 4090):**
+
+| | baseline `5856212` | final | factor |
+|---|---|---|---|
+| **ms/step** | 72.3 | **~1.4** | **~50×** |
+| kernel launches / step | 126 | 36 | −71% |
+| device allocs / step | 436 | 33 | −92% |
+| host uploads / step | 316 | 3 | −99% |
+| optimizer phase | 61.5 ms | 0.05 ms | ~1000× |
+| test-suite wall-clock | ~50 s | ~2 s | ~25× |
+
+**Compute-bound regime (1024×2048):** 46.2 ms (naive) → **4.4 ms** (cuBLAS), 10.4×.
+**Large-activation cliff (4096×2048):** ~200–3100 ms (alloc-bound) → **78 ms** with the pool, ~40×.
+
+**What mattered, in order of impact:**
+1. **Fused optimizer kernels (E1)** — the single biggest win. The optimizer was 82% of the work
+   (~15 ops + ~8 scalar uploads per parameter per step); fusing it to one in-place kernel/param made
+   it ~free. 5.5×.
+2. **Caching the per-launch stride/dim uploads (E2)** — those tiny `Allocate1D(int[])` host→device
+   copies were *blocking the async stream*. Caching them (upload once) gave another 6× and sped the
+   test suite ~16× as a side effect.
+3. **Caching device allocator (E6)** — converts the large-batch `cudaMalloc` thrashing cliff (40×)
+   back to ≈linear; essential past ~1 GB/step of activation churn.
+4. **cuBLAS (E5)** then **tiled GEMM (E3)** — 10.4× / 3.1× on large nets; cuBLAS wins where available.
+5. **`Linear` transpose-copy elimination (E4)** — a clean launch-count + bandwidth cut.
+
+**The big conclusion — it was never the math.** Even after every change, the realistic regimes are
+**launch- and allocation-bound, not compute-bound**: at 1024×2048 the effective rate is only ~3
+TFLOP/s on a ~40-TFLOP/s GPU, because ~36 launches + ~33 allocs/step dominate, not the GEMM. So
+further GEMM tuning (TF32/tensor cores) has low ROI here *and* would break FP32 parity — deliberately
+not pursued. The compounding wins came from **removing per-op overhead** (fused optimizer, cached
+uploads, pooled allocations), exactly where the instrumentation pointed.
+
+**Correctness throughout:** every change gated on the full suite (69→74 tests, +5 new: tiled-GEMM,
+MatMulNT, allocator-transparency); torch-golden optimizer parity preserved; XOR/spiral/regression
+demos still converge (loss→0 / 99.7% / MSE 0.0029).
+
+**Remaining future work (diminishing returns, documented not done):**
+- **Recycle gradient buffers** too (they can alias across inputs → needs ref-counting). Would push the
+  4096×2048 case below 78 ms by removing the residual 22 allocs/step.
+- **Automatic graph-free / arena** so large-activation training gets the pool without an explicit
+  `DisposeGraph()` call — needs a transient-vs-persistent lifetime model (params/optimizer state must
+  survive), a real design change beyond perf tuning.
+- **Fuse more launches** for the small-net floor (bias+activation epilogue, fused MSE) — each shaves a
+  few of the 36 launches; modest, the floor is already ~1 ms.
+- **Tree-reduction kernel** — only matters for very large reductions, not seen as a bottleneck here.
