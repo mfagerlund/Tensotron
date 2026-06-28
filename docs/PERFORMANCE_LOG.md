@@ -110,3 +110,20 @@ Sweep, naive → tiled ms/step (compute-bound rows):
 Small/launch-bound rows are unchanged (within jitter). **Correctness:** 70/70 green (new test added).
 A basic tile (no register blocking) reaches ~2–3× of naive; the open question is whether cuBLAS
 (tensor cores / TF32) does materially better — tested next (E4).
+
+### E4 — `Linear` without the transposed-weight copy (launch-count cut) — *kept*
+
+`Linear.Forward` did `MatMul(x, Weight.T())`, and `T()` **materialized a contiguous transposed copy
+of the weight every forward** (a `StridedCopy` launch + buffer) plus a `Permute` every backward.
+Added `TensorOps.MatMulNT(a,b) = a·bᵀ` that reads both operands through strides (no copy), with a
+stride-only backward (`da = g·b`, `db = gᵀ·a`); `Linear` now uses it. New `MatMulNtOpTests` checks
+forward + both grads against the old `MatMul(x, W.T())` path at a small (naive) and large (tiled) size.
+
+| Metric (default MLP) | After E2/E3 | After E4 |
+|---|---|---|
+| **ms/step** | ~2.0 | **~1.4** |
+| launches/step | 42 | **36** |
+| device allocs/step | 39 | 33 |
+
+Removed exactly the 6 expected launches (3 forward copies + 3 backward permutes) and a weight-sized
+copy per layer per direction (more bandwidth saved as width grows). **72/72 tests green.**

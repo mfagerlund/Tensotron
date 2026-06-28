@@ -78,7 +78,8 @@ public sealed class Linear : Module
 
     public override Tensor Forward(Tensor x)
     {
-        var y = TensorOps.MatMul(x, Weight.T());   // (..., in) @ (in, out)
+        // y = x · Wᵀ via the stride-only matmul (no transposed-weight copy); + bias broadcast.
+        var y = TensorOps.MatMulNT(x, Weight);     // (M, in) · (out, in)ᵀ -> (M, out)
         return Bias is null ? y : TensorOps.Add(y, Bias);
     }
 
