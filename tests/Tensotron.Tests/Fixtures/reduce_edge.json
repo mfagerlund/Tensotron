@@ -1,0 +1,301 @@
+{
+  "op": "reduce_edge",
+  "torch_version": "2.11.0+cpu",
+  "source": "def gen_reduce_edge():\n    # Deterministic edge cases the random fixtures can't hit: zeros under prod,\n    # ties under max/min (first-winner routing), and argmax/argmin tie indices.\n    return [\n        run_reduce_explicit(\"prod\", \"prod one-zero row\", [0., 2., 3.], [1, 3],\n                            lambda x: x.prod(dim=1), [1.0],\n                            {\"op\": \"prod\", \"dims\": [1], \"keepdim\": False}),\n        run_reduce_explicit(\"prod\", \"prod zero+nonzero rows\", [0., 2., 3., 1., 0., 0.], [2, 3],\n                            lambda x: x.prod(dim=1), [1.0, 1.0],\n                            {\"op\": \"prod\", \"dims\": [1], \"keepdim\": False}),\n        run_reduce_explicit(\"max\", \"max tie first-wins\", [2., 2., 1.], [1, 3],\n                            lambda x: x.max(dim=1).values, [10.0],\n                            {\"op\": \"max\", \"dims\": [1], \"keepdim\": False}),\n        run_reduce_explicit(\"min\", \"min tie first-wins\", [3., 1., 1.], [1, 3],\n                            lambda x: x.min(dim=1).values, [10.0],\n                            {\"op\": \"min\", \"dims\": [1], \"keepdim\": False}),\n        # torch returns the FIRST tied index; the random argmax/argmin fixtures never tie.\n        run_reduce_explicit_nograd(\"argmax\", \"argmax tie first-index\", [1., 3., 3., 2., 5., 5., 1., 5.], [2, 4],\n                                   lambda x: x.argmax(dim=1), {\"op\": \"argmax\", \"dims\": [1], \"keepdim\": False}),\n        run_reduce_explicit_nograd(\"argmin\", \"argmin tie first-index\", [2., 1., 1., 3., 4., 4., 4., 9.], [2, 4],\n                                   lambda x: x.argmin(dim=1), {\"op\": \"argmin\", \"dims\": [1], \"keepdim\": False}),\n    ]\n",
+  "cases": [
+    {
+      "name": "prod one-zero row",
+      "meta": {
+        "op": "prod",
+        "dims": [
+          1
+        ],
+        "keepdim": false
+      },
+      "inputs": [
+        {
+          "shape": [
+            1,
+            3
+          ],
+          "data": [
+            0.0,
+            2.0,
+            3.0
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          1
+        ],
+        "data": [
+          1.0
+        ]
+      },
+      "output": {
+        "shape": [
+          1
+        ],
+        "data": [
+          0.0
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            1,
+            3
+          ],
+          "data": [
+            6.0,
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "prod zero+nonzero rows",
+      "meta": {
+        "op": "prod",
+        "dims": [
+          1
+        ],
+        "keepdim": false
+      },
+      "inputs": [
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            0.0,
+            2.0,
+            3.0,
+            1.0,
+            0.0,
+            0.0
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          2
+        ],
+        "data": [
+          1.0,
+          1.0
+        ]
+      },
+      "output": {
+        "shape": [
+          2
+        ],
+        "data": [
+          0.0,
+          0.0
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            6.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "max tie first-wins",
+      "meta": {
+        "op": "max",
+        "dims": [
+          1
+        ],
+        "keepdim": false
+      },
+      "inputs": [
+        {
+          "shape": [
+            1,
+            3
+          ],
+          "data": [
+            2.0,
+            2.0,
+            1.0
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          1
+        ],
+        "data": [
+          10.0
+        ]
+      },
+      "output": {
+        "shape": [
+          1
+        ],
+        "data": [
+          2.0
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            1,
+            3
+          ],
+          "data": [
+            10.0,
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "min tie first-wins",
+      "meta": {
+        "op": "min",
+        "dims": [
+          1
+        ],
+        "keepdim": false
+      },
+      "inputs": [
+        {
+          "shape": [
+            1,
+            3
+          ],
+          "data": [
+            3.0,
+            1.0,
+            1.0
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          1
+        ],
+        "data": [
+          10.0
+        ]
+      },
+      "output": {
+        "shape": [
+          1
+        ],
+        "data": [
+          1.0
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            1,
+            3
+          ],
+          "data": [
+            0.0,
+            10.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "argmax tie first-index",
+      "meta": {
+        "op": "argmax",
+        "dims": [
+          1
+        ],
+        "keepdim": false
+      },
+      "inputs": [
+        {
+          "shape": [
+            2,
+            4
+          ],
+          "data": [
+            1.0,
+            3.0,
+            3.0,
+            2.0,
+            5.0,
+            5.0,
+            1.0,
+            5.0
+          ]
+        }
+      ],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          2
+        ],
+        "data": [
+          1.0,
+          0.0
+        ]
+      },
+      "grads": []
+    },
+    {
+      "name": "argmin tie first-index",
+      "meta": {
+        "op": "argmin",
+        "dims": [
+          1
+        ],
+        "keepdim": false
+      },
+      "inputs": [
+        {
+          "shape": [
+            2,
+            4
+          ],
+          "data": [
+            2.0,
+            1.0,
+            1.0,
+            3.0,
+            4.0,
+            4.0,
+            4.0,
+            9.0
+          ]
+        }
+      ],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          2
+        ],
+        "data": [
+          1.0,
+          0.0
+        ]
+      },
+      "grads": []
+    }
+  ]
+}

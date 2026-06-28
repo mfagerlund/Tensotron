@@ -1,0 +1,127 @@
+{
+  "op": "sched",
+  "torch_version": "2.11.0+cpu",
+  "source": "def gen_sched():\n    L = torch.optim.lr_scheduler\n\n    def make(kind, opt, c):\n        if kind == \"step\": return L.StepLR(opt, step_size=int(c[\"step_size\"]), gamma=c[\"gamma\"])\n        if kind == \"exp\": return L.ExponentialLR(opt, gamma=c[\"gamma\"])\n        if kind == \"cosine\": return L.CosineAnnealingLR(opt, T_max=int(c[\"t_max\"]), eta_min=c.get(\"eta_min\", 0.0))\n        if kind == \"linear\": return L.LinearLR(opt, start_factor=c[\"start\"], end_factor=c[\"end\"], total_iters=int(c[\"total\"]))\n        raise ValueError(kind)\n\n    def seq(name, kind, cfg, n=8):\n        p = torch.zeros(1, requires_grad=True)\n        p.grad = torch.zeros_like(p)\n        opt = torch.optim.SGD([p], lr=cfg[\"lr\"])\n        sch = make(kind, opt, cfg)\n        lrs = [opt.param_groups[0][\"lr\"]]\n        for _ in range(n):\n            opt.step()\n            sch.step()\n            lrs.append(opt.param_groups[0][\"lr\"])\n        return {\"name\": name, \"meta\": {\"op\": kind, \"config\": cfg},\n                \"inputs\": [], \"grad_output\": None,\n                \"output\": {\"shape\": [len(lrs)], \"data\": [float(v) for v in lrs]}, \"grads\": []}\n\n    return [\n        seq(\"step size2 gamma0.5\", \"step\", {\"lr\": 0.1, \"step_size\": 2, \"gamma\": 0.5}),\n        seq(\"exp gamma0.9\", \"exp\", {\"lr\": 0.1, \"gamma\": 0.9}),\n        seq(\"cosine tmax5 etamin0.01\", \"cosine\", {\"lr\": 0.1, \"t_max\": 5, \"eta_min\": 0.01}),\n        seq(\"linear warmup\", \"linear\", {\"lr\": 0.1, \"start\": 0.1, \"end\": 1.0, \"total\": 4}),\n    ]\n",
+  "cases": [
+    {
+      "name": "step size2 gamma0.5",
+      "meta": {
+        "op": "step",
+        "config": {
+          "lr": 0.1,
+          "step_size": 2,
+          "gamma": 0.5
+        }
+      },
+      "inputs": [],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          9
+        ],
+        "data": [
+          0.1,
+          0.1,
+          0.05,
+          0.05,
+          0.025,
+          0.025,
+          0.0125,
+          0.0125,
+          0.00625
+        ]
+      },
+      "grads": []
+    },
+    {
+      "name": "exp gamma0.9",
+      "meta": {
+        "op": "exp",
+        "config": {
+          "lr": 0.1,
+          "gamma": 0.9
+        }
+      },
+      "inputs": [],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          9
+        ],
+        "data": [
+          0.1,
+          0.09000000000000001,
+          0.08100000000000002,
+          0.07290000000000002,
+          0.06561000000000002,
+          0.05904900000000002,
+          0.05314410000000002,
+          0.04782969000000002,
+          0.043046721000000024
+        ]
+      },
+      "grads": []
+    },
+    {
+      "name": "cosine tmax5 etamin0.01",
+      "meta": {
+        "op": "cosine",
+        "config": {
+          "lr": 0.1,
+          "t_max": 5,
+          "eta_min": 0.01
+        }
+      },
+      "inputs": [],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          9
+        ],
+        "data": [
+          0.1,
+          0.09140576474687263,
+          0.06890576474687263,
+          0.04109423525312736,
+          0.018594235253127367,
+          0.01,
+          0.018594235253127367,
+          0.041094235253127366,
+          0.06890576474687263
+        ]
+      },
+      "grads": []
+    },
+    {
+      "name": "linear warmup",
+      "meta": {
+        "op": "linear",
+        "config": {
+          "lr": 0.1,
+          "start": 0.1,
+          "end": 1.0,
+          "total": 4
+        }
+      },
+      "inputs": [],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          9
+        ],
+        "data": [
+          0.010000000000000002,
+          0.03250000000000001,
+          0.055000000000000014,
+          0.07750000000000003,
+          0.10000000000000003,
+          0.10000000000000003,
+          0.10000000000000003,
+          0.10000000000000003,
+          0.10000000000000003
+        ]
+      },
+      "grads": []
+    }
+  ]
+}

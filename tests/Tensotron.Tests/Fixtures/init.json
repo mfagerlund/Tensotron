@@ -1,0 +1,276 @@
+{
+  "op": "init",
+  "torch_version": "2.11.0+cpu",
+  "source": "def gen_init():\n    # Scalar parity for the scale formulas (the random draws themselves can't match\n    # torch's bit-stream, so we verify fan/gain/bound/std against torch's own values).\n    import torch.nn.init as NI\n    import math\n    cases = []\n\n    def fan(shape):\n        w = torch.empty(*shape)\n        fi, fo = NI._calculate_fan_in_and_fan_out(w)\n        return {\"name\": f\"fan {shape}\", \"meta\": {\"op\": \"fan\", \"dims\": shape},\n                \"inputs\": [], \"grad_output\": None,\n                \"output\": {\"shape\": [2], \"data\": [float(fi), float(fo)]}, \"grads\": []}\n\n    def gain(nl, a=0.0):\n        g = NI.calculate_gain(nl, a) if nl == \"leaky_relu\" else NI.calculate_gain(nl)\n        return {\"name\": f\"gain {nl} a={a}\", \"meta\": {\"op\": \"gain\", \"reduction\": nl, \"params\": [a]},\n                \"inputs\": [], \"grad_output\": None,\n                \"output\": {\"shape\": [1], \"data\": [float(g)]}, \"grads\": []}\n\n    def ku_bound(shape, a, nl):\n        w = torch.empty(*shape)\n        fan_in, _ = NI._calculate_fan_in_and_fan_out(w)\n        std = NI.calculate_gain(nl, a) / math.sqrt(fan_in)\n        bound = math.sqrt(3.0) * std\n        return {\"name\": f\"kaiming_uniform bound {shape} a={a} {nl}\",\n                \"meta\": {\"op\": \"kaiming_uniform_bound\", \"dims\": shape, \"reduction\": nl, \"params\": [a]},\n                \"inputs\": [], \"grad_output\": None,\n                \"output\": {\"shape\": [1], \"data\": [float(bound)]}, \"grads\": []}\n\n    def xu_bound(shape, gain_v):\n        w = torch.empty(*shape)\n        fan_in, fan_out = NI._calculate_fan_in_and_fan_out(w)\n        std = gain_v * math.sqrt(2.0 / (fan_in + fan_out))\n        bound = math.sqrt(3.0) * std\n        return {\"name\": f\"xavier_uniform bound {shape} gain={gain_v}\",\n                \"meta\": {\"op\": \"xavier_uniform_bound\", \"dims\": shape, \"params\": [gain_v]},\n                \"inputs\": [], \"grad_output\": None,\n                \"output\": {\"shape\": [1], \"data\": [float(bound)]}, \"grads\": []}\n\n    cases += [fan([4, 6]), fan([2, 3, 4])]\n    cases += [gain(\"relu\"), gain(\"tanh\"), gain(\"linear\"), gain(\"selu\"),\n              gain(\"leaky_relu\", 0.2), gain(\"leaky_relu\", math.sqrt(5))]\n    cases += [ku_bound([4, 6], 0.0, \"relu\"), ku_bound([8, 5], math.sqrt(5), \"leaky_relu\")]\n    cases += [xu_bound([4, 6], 1.0), xu_bound([8, 5], 1.5)]\n    return cases\n",
+  "cases": [
+    {
+      "name": "fan [4, 6]",
+      "meta": {
+        "op": "fan",
+        "dims": [
+          4,
+          6
+        ]
+      },
+      "inputs": [],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          2
+        ],
+        "data": [
+          6.0,
+          4.0
+        ]
+      },
+      "grads": []
+    },
+    {
+      "name": "fan [2, 3, 4]",
+      "meta": {
+        "op": "fan",
+        "dims": [
+          2,
+          3,
+          4
+        ]
+      },
+      "inputs": [],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          2
+        ],
+        "data": [
+          12.0,
+          8.0
+        ]
+      },
+      "grads": []
+    },
+    {
+      "name": "gain relu a=0.0",
+      "meta": {
+        "op": "gain",
+        "reduction": "relu",
+        "params": [
+          0.0
+        ]
+      },
+      "inputs": [],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          1
+        ],
+        "data": [
+          1.4142135623730951
+        ]
+      },
+      "grads": []
+    },
+    {
+      "name": "gain tanh a=0.0",
+      "meta": {
+        "op": "gain",
+        "reduction": "tanh",
+        "params": [
+          0.0
+        ]
+      },
+      "inputs": [],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          1
+        ],
+        "data": [
+          1.6666666666666667
+        ]
+      },
+      "grads": []
+    },
+    {
+      "name": "gain linear a=0.0",
+      "meta": {
+        "op": "gain",
+        "reduction": "linear",
+        "params": [
+          0.0
+        ]
+      },
+      "inputs": [],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          1
+        ],
+        "data": [
+          1.0
+        ]
+      },
+      "grads": []
+    },
+    {
+      "name": "gain selu a=0.0",
+      "meta": {
+        "op": "gain",
+        "reduction": "selu",
+        "params": [
+          0.0
+        ]
+      },
+      "inputs": [],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          1
+        ],
+        "data": [
+          0.75
+        ]
+      },
+      "grads": []
+    },
+    {
+      "name": "gain leaky_relu a=0.2",
+      "meta": {
+        "op": "gain",
+        "reduction": "leaky_relu",
+        "params": [
+          0.2
+        ]
+      },
+      "inputs": [],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          1
+        ],
+        "data": [
+          1.3867504905630728
+        ]
+      },
+      "grads": []
+    },
+    {
+      "name": "gain leaky_relu a=2.23606797749979",
+      "meta": {
+        "op": "gain",
+        "reduction": "leaky_relu",
+        "params": [
+          2.23606797749979
+        ]
+      },
+      "inputs": [],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          1
+        ],
+        "data": [
+          0.5773502691896257
+        ]
+      },
+      "grads": []
+    },
+    {
+      "name": "kaiming_uniform bound [4, 6] a=0.0 relu",
+      "meta": {
+        "op": "kaiming_uniform_bound",
+        "dims": [
+          4,
+          6
+        ],
+        "reduction": "relu",
+        "params": [
+          0.0
+        ]
+      },
+      "inputs": [],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          1
+        ],
+        "data": [
+          1.0
+        ]
+      },
+      "grads": []
+    },
+    {
+      "name": "kaiming_uniform bound [8, 5] a=2.23606797749979 leaky_relu",
+      "meta": {
+        "op": "kaiming_uniform_bound",
+        "dims": [
+          8,
+          5
+        ],
+        "reduction": "leaky_relu",
+        "params": [
+          2.23606797749979
+        ]
+      },
+      "inputs": [],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          1
+        ],
+        "data": [
+          0.44721359549995787
+        ]
+      },
+      "grads": []
+    },
+    {
+      "name": "xavier_uniform bound [4, 6] gain=1.0",
+      "meta": {
+        "op": "xavier_uniform_bound",
+        "dims": [
+          4,
+          6
+        ],
+        "params": [
+          1.0
+        ]
+      },
+      "inputs": [],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          1
+        ],
+        "data": [
+          0.7745966692414833
+        ]
+      },
+      "grads": []
+    },
+    {
+      "name": "xavier_uniform bound [8, 5] gain=1.5",
+      "meta": {
+        "op": "xavier_uniform_bound",
+        "dims": [
+          8,
+          5
+        ],
+        "params": [
+          1.5
+        ]
+      },
+      "inputs": [],
+      "grad_output": null,
+      "output": {
+        "shape": [
+          1
+        ],
+        "data": [
+          1.0190493307301363
+        ]
+      },
+      "grads": []
+    }
+  ]
+}

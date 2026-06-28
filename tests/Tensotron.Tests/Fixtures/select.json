@@ -1,0 +1,272 @@
+{
+  "op": "select",
+  "torch_version": "2.11.0+cpu",
+  "source": "def gen_select():\n    def case(name, op, ashape, bshape, fn, params=None):\n        a = torch.randn(*ashape).clone().detach().requires_grad_(True)\n        b = torch.randn(*bshape).clone().detach().requires_grad_(True)\n        out = fn(a, b)\n        grad_output = torch.randn_like(out)\n        out.backward(grad_output)\n        return {\n            \"name\": name,\n            \"meta\": {\"op\": op, \"params\": params},\n            \"inputs\": [{\"shape\": list(a.shape), \"data\": a.detach().flatten().tolist()},\n                       {\"shape\": list(b.shape), \"data\": b.detach().flatten().tolist()}],\n            \"grad_output\": _t(grad_output),\n            \"output\": _t(out),\n            \"grads\": [_t(a.grad), _t(b.grad)],\n        }\n    # where: cond derived from a>0; grads flow to a and b.\n    where_fn = lambda a, b: torch.where(a > 0, a, b)\n    # masked_fill: mask derived from b>0 (no grad to b); grad flows to a only.\n    def masked_case(name, shape):\n        a = torch.randn(*shape).clone().detach().requires_grad_(True)\n        mask = torch.randn(*shape) > 0\n        out = a.masked_fill(mask, 0.5)\n        grad_output = torch.randn_like(out)\n        out.backward(grad_output)\n        return {\n            \"name\": name,\n            \"meta\": {\"op\": \"masked_fill\", \"params\": [0.5]},\n            \"inputs\": [{\"shape\": list(a.shape), \"data\": a.detach().flatten().tolist()},\n                       {\"shape\": list(mask.shape), \"data\": mask.float().flatten().tolist()}],\n            \"grad_output\": _t(grad_output),\n            \"output\": _t(out),\n            \"grads\": [_t(a.grad)],\n        }\n    return [\n        case(\"where 2x3,2x3\", \"where\", [2, 3], [2, 3], where_fn),\n        case(\"where 2x3,3 (bcast)\", \"where\", [2, 3], [3], where_fn),\n        masked_case(\"masked_fill 2x3\", [2, 3]),\n    ]\n",
+  "cases": [
+    {
+      "name": "where 2x3,2x3",
+      "meta": {
+        "op": "where",
+        "params": null
+      },
+      "inputs": [
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            -0.10166017711162567,
+            -0.35416117310523987,
+            -0.8470762372016907,
+            0.5377655625343323,
+            -0.10167048126459122,
+            0.3124214708805084
+          ]
+        },
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            0.8431409597396851,
+            -0.5868682265281677,
+            -1.4045864343643188,
+            -2.046968460083008,
+            -0.6225749254226685,
+            -0.9962305426597595
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          2,
+          3
+        ],
+        "data": [
+          0.18527986109256744,
+          1.2287113666534424,
+          -0.6025518178939819,
+          1.1601941585540771,
+          -0.09205123782157898,
+          -2.1830711364746094
+        ]
+      },
+      "output": {
+        "shape": [
+          2,
+          3
+        ],
+        "data": [
+          0.8431409597396851,
+          -0.5868682265281677,
+          -1.4045864343643188,
+          0.5377655625343323,
+          -0.6225749254226685,
+          0.3124214708805084
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            0.0,
+            0.0,
+            0.0,
+            1.1601941585540771,
+            0.0,
+            -2.1830711364746094
+          ]
+        },
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            0.18527986109256744,
+            1.2287113666534424,
+            -0.6025518178939819,
+            0.0,
+            -0.09205123782157898,
+            0.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "where 2x3,3 (bcast)",
+      "meta": {
+        "op": "where",
+        "params": null
+      },
+      "inputs": [
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            1.0611236095428467,
+            -1.5108402967453003,
+            -0.018032485619187355,
+            0.5990075469017029,
+            1.2807937860488892,
+            0.7644539475440979
+          ]
+        },
+        {
+          "shape": [
+            3
+          ],
+          "data": [
+            1.8589085340499878,
+            -0.8470671772956848,
+            1.0756394863128662
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          2,
+          3
+        ],
+        "data": [
+          2.3353071212768555,
+          -0.0819971039891243,
+          -2.2440378665924072,
+          0.4317534565925598,
+          0.3255320191383362,
+          0.47831037640571594
+        ]
+      },
+      "output": {
+        "shape": [
+          2,
+          3
+        ],
+        "data": [
+          1.0611236095428467,
+          -0.8470671772956848,
+          1.0756394863128662,
+          0.5990075469017029,
+          1.2807937860488892,
+          0.7644539475440979
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            2.3353071212768555,
+            0.0,
+            0.0,
+            0.4317534565925598,
+            0.3255320191383362,
+            0.47831037640571594
+          ]
+        },
+        {
+          "shape": [
+            3
+          ],
+          "data": [
+            0.0,
+            -0.0819971039891243,
+            -2.2440378665924072
+          ]
+        }
+      ]
+    },
+    {
+      "name": "masked_fill 2x3",
+      "meta": {
+        "op": "masked_fill",
+        "params": [
+          0.5
+        ]
+      },
+      "inputs": [
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            0.3719557225704193,
+            0.13479584455490112,
+            1.2398431301116943,
+            0.32837507128715515,
+            0.532970666885376,
+            -0.5833172798156738
+          ]
+        },
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          2,
+          3
+        ],
+        "data": [
+          -0.03270167484879494,
+          0.5196128487586975,
+          0.3676386773586273,
+          -1.3011032342910767,
+          0.9283043146133423,
+          0.9619895219802856
+        ]
+      },
+      "output": {
+        "shape": [
+          2,
+          3
+        ],
+        "data": [
+          0.5,
+          0.13479584455490112,
+          1.2398431301116943,
+          0.32837507128715515,
+          0.532970666885376,
+          -0.5833172798156738
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            0.0,
+            0.5196128487586975,
+            0.3676386773586273,
+            -1.3011032342910767,
+            0.9283043146133423,
+            0.9619895219802856
+          ]
+        }
+      ]
+    }
+  ]
+}

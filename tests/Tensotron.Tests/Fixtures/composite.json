@@ -1,0 +1,574 @@
+{
+  "op": "composite",
+  "torch_version": "2.11.0+cpu",
+  "source": "def gen_composite():\n    import torch.nn.functional as TF\n    # op (for C# dispatch) is kept separate from the display name so we can sweep parameters\n    # and add boundary inputs without breaking the meta.op switch.\n    def c(op, name, fn, params, data=None, grad=None):\n        x = torch.randn(2, 3) if data is None else torch.tensor(data, dtype=torch.float32)\n        x = x.clone().detach().requires_grad_(True)\n        out = fn(x)\n        go = torch.ones_like(out) if grad is None else torch.tensor(grad, dtype=torch.float32).reshape(out.shape)\n        out.backward(go)\n        return {\n            \"name\": name,\n            \"meta\": {\"op\": op, \"params\": params},\n            \"inputs\": [{\"shape\": list(x.shape), \"data\": x.detach().flatten().tolist()}],\n            \"grad_output\": _t(go),\n            \"output\": _t(out),\n            \"grads\": [_t(x.grad)],\n        }\n    # Spans negatives, exact 0 (the kink), and positives \u2014 including the bounds for clamp.\n    kink = [-2.0, -0.5, 0.0, 0.5, 2.0]\n    return [\n        c(\"clamp\", \"clamp\", lambda x: x.clamp(-0.5, 0.5), [-0.5, 0.5]),\n        c(\"clamp\", \"clamp @ bounds\", lambda x: x.clamp(-0.5, 0.5), [-0.5, 0.5], data=kink),\n        # leaky_relu: sweep the slope across the regimes a naive max(x, slope*x) gets wrong \u2014\n        # <1 (where it accidentally agrees), >1, and negative \u2014 each hitting x==0.\n        c(\"leaky_relu\", \"leaky_relu 0.1\", lambda x: TF.leaky_relu(x, 0.1), [0.1]),\n        c(\"leaky_relu\", \"leaky_relu 0.1 @ kink\", lambda x: TF.leaky_relu(x, 0.1), [0.1], data=kink),\n        c(\"leaky_relu\", \"leaky_relu 2.0 @ kink\", lambda x: TF.leaky_relu(x, 2.0), [2.0], data=kink),\n        c(\"leaky_relu\", \"leaky_relu -0.5 @ kink\", lambda x: TF.leaky_relu(x, -0.5), [-0.5], data=kink),\n        # elu: sweep alpha; the gradient at x==0 must equal alpha (not a tie-split).\n        c(\"elu\", \"elu 1.0 @ kink\", lambda x: TF.elu(x, 1.0), [1.0], data=kink),\n        c(\"elu\", \"elu 1.3 @ kink\", lambda x: TF.elu(x, 1.3), [1.3], data=kink),\n        c(\"elu\", \"elu 0.5 @ kink\", lambda x: TF.elu(x, 0.5), [0.5], data=kink),\n    ]\n",
+  "cases": [
+    {
+      "name": "clamp",
+      "meta": {
+        "op": "clamp",
+        "params": [
+          -0.5,
+          0.5
+        ]
+      },
+      "inputs": [
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            0.28217267990112305,
+            -1.4730162620544434,
+            0.3793288767337799,
+            -0.26294511556625366,
+            1.48405122756958,
+            -0.2907368540763855
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          2,
+          3
+        ],
+        "data": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "output": {
+        "shape": [
+          2,
+          3
+        ],
+        "data": [
+          0.28217267990112305,
+          -0.5,
+          0.3793288767337799,
+          -0.26294511556625366,
+          0.5,
+          -0.2907368540763855
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            1.0,
+            0.0,
+            1.0,
+            1.0,
+            0.0,
+            1.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "clamp @ bounds",
+      "meta": {
+        "op": "clamp",
+        "params": [
+          -0.5,
+          0.5
+        ]
+      },
+      "inputs": [
+        {
+          "shape": [
+            5
+          ],
+          "data": [
+            -2.0,
+            -0.5,
+            0.0,
+            0.5,
+            2.0
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          5
+        ],
+        "data": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "output": {
+        "shape": [
+          5
+        ],
+        "data": [
+          -0.5,
+          -0.5,
+          0.0,
+          0.5,
+          0.5
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            5
+          ],
+          "data": [
+            0.0,
+            1.0,
+            1.0,
+            1.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "leaky_relu 0.1",
+      "meta": {
+        "op": "leaky_relu",
+        "params": [
+          0.1
+        ]
+      },
+      "inputs": [
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            -1.5104938745498657,
+            -0.36959919333457947,
+            -0.4661034047603607,
+            -0.7234014272689819,
+            -1.6349503993988037,
+            1.4051132202148438
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          2,
+          3
+        ],
+        "data": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "output": {
+        "shape": [
+          2,
+          3
+        ],
+        "data": [
+          -0.1510493904352188,
+          -0.036959920078516006,
+          -0.04661034047603607,
+          -0.07234014570713043,
+          -0.1634950488805771,
+          1.4051132202148438
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            0.10000000149011612,
+            0.10000000149011612,
+            0.10000000149011612,
+            0.10000000149011612,
+            0.10000000149011612,
+            1.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "leaky_relu 0.1 @ kink",
+      "meta": {
+        "op": "leaky_relu",
+        "params": [
+          0.1
+        ]
+      },
+      "inputs": [
+        {
+          "shape": [
+            5
+          ],
+          "data": [
+            -2.0,
+            -0.5,
+            0.0,
+            0.5,
+            2.0
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          5
+        ],
+        "data": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "output": {
+        "shape": [
+          5
+        ],
+        "data": [
+          -0.20000000298023224,
+          -0.05000000074505806,
+          0.0,
+          0.5,
+          2.0
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            5
+          ],
+          "data": [
+            0.10000000149011612,
+            0.10000000149011612,
+            0.10000000149011612,
+            1.0,
+            1.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "leaky_relu 2.0 @ kink",
+      "meta": {
+        "op": "leaky_relu",
+        "params": [
+          2.0
+        ]
+      },
+      "inputs": [
+        {
+          "shape": [
+            5
+          ],
+          "data": [
+            -2.0,
+            -0.5,
+            0.0,
+            0.5,
+            2.0
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          5
+        ],
+        "data": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "output": {
+        "shape": [
+          5
+        ],
+        "data": [
+          -4.0,
+          -1.0,
+          0.0,
+          0.5,
+          2.0
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            5
+          ],
+          "data": [
+            2.0,
+            2.0,
+            2.0,
+            1.0,
+            1.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "leaky_relu -0.5 @ kink",
+      "meta": {
+        "op": "leaky_relu",
+        "params": [
+          -0.5
+        ]
+      },
+      "inputs": [
+        {
+          "shape": [
+            5
+          ],
+          "data": [
+            -2.0,
+            -0.5,
+            0.0,
+            0.5,
+            2.0
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          5
+        ],
+        "data": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "output": {
+        "shape": [
+          5
+        ],
+        "data": [
+          1.0,
+          0.25,
+          -0.0,
+          0.5,
+          2.0
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            5
+          ],
+          "data": [
+            -0.5,
+            -0.5,
+            -0.5,
+            1.0,
+            1.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "elu 1.0 @ kink",
+      "meta": {
+        "op": "elu",
+        "params": [
+          1.0
+        ]
+      },
+      "inputs": [
+        {
+          "shape": [
+            5
+          ],
+          "data": [
+            -2.0,
+            -0.5,
+            0.0,
+            0.5,
+            2.0
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          5
+        ],
+        "data": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "output": {
+        "shape": [
+          5
+        ],
+        "data": [
+          -0.8646647334098816,
+          -0.39346933364868164,
+          0.0,
+          0.5,
+          2.0
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            5
+          ],
+          "data": [
+            0.1353352814912796,
+            0.6065306663513184,
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "elu 1.3 @ kink",
+      "meta": {
+        "op": "elu",
+        "params": [
+          1.3
+        ]
+      },
+      "inputs": [
+        {
+          "shape": [
+            5
+          ],
+          "data": [
+            -2.0,
+            -0.5,
+            0.0,
+            0.5,
+            2.0
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          5
+        ],
+        "data": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "output": {
+        "shape": [
+          5
+        ],
+        "data": [
+          -1.1240640878677368,
+          -0.5115101337432861,
+          0.0,
+          0.5,
+          2.0
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            5
+          ],
+          "data": [
+            0.17593586444854736,
+            0.788489818572998,
+            1.2999999523162842,
+            1.0,
+            1.0
+          ]
+        }
+      ]
+    },
+    {
+      "name": "elu 0.5 @ kink",
+      "meta": {
+        "op": "elu",
+        "params": [
+          0.5
+        ]
+      },
+      "inputs": [
+        {
+          "shape": [
+            5
+          ],
+          "data": [
+            -2.0,
+            -0.5,
+            0.0,
+            0.5,
+            2.0
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          5
+        ],
+        "data": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "output": {
+        "shape": [
+          5
+        ],
+        "data": [
+          -0.4323323667049408,
+          -0.19673466682434082,
+          0.0,
+          0.5,
+          2.0
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            5
+          ],
+          "data": [
+            0.0676676407456398,
+            0.3032653331756592,
+            0.5,
+            1.0,
+            1.0
+          ]
+        }
+      ]
+    }
+  ]
+}

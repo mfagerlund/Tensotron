@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Tensotron.Showcase — "Tensotron can be used for these things".
+
+    Unlike Tensotron.Tests (which proves the library matches PyTorch op-for-op), this
+    project proves the library is usable for real end-to-end learning tasks: training a
+    continuous PPO controller to balance pole-carts, and training a CNN on MNIST. The
+    tasks assert that learning actually happens, and emit SVG replays of the best runs.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <!-- Real Skipped status for GPU-gated showcase tests (xUnit v2 has no dynamic Assert.Skip). -->
+    <PackageReference Include="Xunit.SkippableFact" Version="1.5.23" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Tensotron\Tensotron.csproj" />
+  </ItemGroup>
+
+</Project>
