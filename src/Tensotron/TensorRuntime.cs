@@ -230,10 +230,41 @@ public sealed class TensorRuntime : IDisposable
     public void ResetCounters() { Launches = 0; Allocs = 0; HostUploads = 0; }
     internal void NoteHostUpload() => HostUploads++;
 
+    // ---- caching device allocator (size-bucketed free list) ----
+    // Reuse is always on (harmless: an empty pool just falls through to a real allocation). The
+    // pool is FED only by explicit Tensor.Dispose() — so default, non-disposing code is byte-for-byte
+    // unchanged. Code that bounds its own lifetime (inference loops, or training that frees each
+    // step's graph via Tensor.DisposeGraph) recycles buffers instead of churning cudaMalloc/free,
+    // which is the dominant cost once activations get large (see PERFORMANCE_LOG E6).
+    private readonly Dictionary<int, Stack<MemoryBuffer1D<float, Stride1D.Dense>>> _floatPool = new();
+    private long _pooledBytes;
+    private const long MaxPooledBytes = 1L << 30; // cap retained pool memory at ~1 GB
+    public bool PoolingEnabled { get; set; } = true;
+    /// <summary>Buffers served from the pool (no device allocation). Bench/diagnostics only.</summary>
+    public long PoolHits { get; private set; }
+
     public MemoryBuffer1D<float, Stride1D.Dense> Allocate(int length)
     {
+        if (PoolingEnabled && _floatPool.TryGetValue(length, out var stack) && stack.Count > 0)
+        {
+            var pooled = stack.Pop();
+            _pooledBytes -= (long)length * sizeof(float);
+            PoolHits++;
+            return pooled;
+        }
         Allocs++;
         return Accelerator.Allocate1D<float>(length);
+    }
+
+    // Return an owned float buffer for reuse (called by Tensor.Dispose). Over the cap → really free.
+    internal void ReturnToPool(MemoryBuffer1D<float, Stride1D.Dense> buf)
+    {
+        long bytes = (long)buf.Length * sizeof(float);
+        if (!PoolingEnabled || _pooledBytes + bytes > MaxPooledBytes) { buf.Dispose(); return; }
+        int len = (int)buf.Length;
+        if (!_floatPool.TryGetValue(len, out var stack)) { stack = new(); _floatPool[len] = stack; }
+        stack.Push(buf);
+        _pooledBytes += bytes;
     }
 
     // ---- async batching ----
@@ -712,6 +743,9 @@ public sealed class TensorRuntime : IDisposable
     public void Dispose()
     {
         _blas?.Dispose();
+        foreach (var stack in _floatPool.Values)
+            foreach (var b in stack) b.Dispose();
+        _floatPool.Clear();
         foreach (var b in _intCache.Values) b.Dispose();
         _intCache.Clear();
         foreach (var b in _pendingInts) b.Dispose();

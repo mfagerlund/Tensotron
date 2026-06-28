@@ -107,7 +107,30 @@ public sealed partial class Tensor : IDisposable
         // Only the data buffer is freed, and only if owned. Grad is intentionally NOT disposed:
         // gradients can be aliased across inputs (e.g. Add passes one upstream grad to both
         // operands), so freeing here would risk a use-after-free. Grads are GC-reclaimed.
-        if (OwnsBuffer) Buffer.Dispose();
+        // The buffer is returned to the runtime's pool for reuse (it really frees over the cap).
+        if (OwnsBuffer) Runtime.ReturnToPool(Buffer);
+    }
+
+    /// <summary>
+    /// Recycle every interior (op-produced) buffer reachable from this tensor back to the runtime's
+    /// allocator pool — the deterministic "free the graph" PyTorch does after a non-retained backward.
+    /// Leaves (parameters / inputs, Node == null) and this tensor itself are left intact. Call AFTER
+    /// backward + optimizer step, when the forward activations are dead; with a bounded buffer pool
+    /// this turns large-activation training from cudaMalloc-bound into reuse (see PERFORMANCE_LOG E6).
+    /// Caller owns the no-live-view contract, same as <see cref="Dispose"/>.
+    /// </summary>
+    public void DisposeGraph()
+    {
+        var seen = new HashSet<Tensor>();
+        void Go(Tensor t)
+        {
+            if (!seen.Add(t)) return;
+            if (t.Node == null) return;                 // leaf: stop, never free params/inputs
+            foreach (var inp in t.Node.Inputs) Go(inp);
+            if (!ReferenceEquals(t, this) && t.OwnsBuffer && !t.IsDisposed)
+                t.Dispose();                            // recycle this interior activation
+        }
+        Go(this);
     }
 
     /// <summary>True if this tensor participates in gradient flow.</summary>

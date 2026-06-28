@@ -44,13 +44,31 @@ public static class BenchExample
         Console.WriteLine();
     }
 
+    /// <summary>Caching-allocator probe: heavy (large-activation) configs run with the per-step
+    /// graph recycled (Tensor.DisposeGraph → pooled buffers) vs not, exposing the cudaMalloc cliff.</summary>
+    public static void Pool()
+    {
+        Console.WriteLine("== Bench: caching allocator on large activations ==");
+        Console.WriteLine("  config            | pool-off (no recycle)     | pool-on (DisposeGraph)");
+        (int b, int w)[] configs = { (1024, 2048), (4096, 2048) };
+        foreach (var (b, w) in configs)
+        {
+            var off = Measure(b, 64, w, 2, 80, 20, attribute: false, freeGraph: false);
+            var on = Measure(b, 64, w, 2, 80, 20, attribute: false, freeGraph: true);
+            Console.WriteLine($"  batch {b,4} width {w,4} | {off.MsPerStep,8:0.0} ms {off.AllocsPerStep,5:0} alloc/s | " +
+                              $"{on.MsPerStep,8:0.0} ms {on.AllocsPerStep,5:0} alloc/s  ({off.MsPerStep / on.MsPerStep:0.0}× )");
+        }
+        Console.WriteLine();
+    }
+
     public readonly record struct Result(
         int Batch, int InDim, int Width, int Depth, int Timed,
         double TotalMs, double MsPerStep,
         double FwdMs, double BwdMs, double OptMs,
         double LaunchesPerStep, double AllocsPerStep, double HostUploadsPerStep);
 
-    private static Result Measure(int batch, int inDim, int width, int depth, int steps, int warmup, bool attribute)
+    private static Result Measure(int batch, int inDim, int width, int depth, int steps, int warmup,
+        bool attribute, bool freeGraph = false)
     {
         Init.Seed(0);
         var rng = new Random(0);
@@ -84,6 +102,7 @@ public static class BenchExample
             loss.Backward();
             opt.Step();
             if (step == steps - 1) _ = loss.Item(); // force a final host sync so timing is honest
+            if (freeGraph) loss.DisposeGraph();      // recycle this step's activations into the pool
         }
         sw.Stop();
         int timed = steps - warmup;

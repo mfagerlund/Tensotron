@@ -155,3 +155,28 @@ Small nets also improved (launch floor now **~0.7–0.9 ms**; 64×512 = 0.72). *
 4.43 ms row → 44× the time). cuBLAS is fast here; the cost is the **allocator**: 4096×2048 activations
 are ~33 MB each, ×33 allocs/step ≈ 1 GB of `cudaMalloc`/free churn per step. This is the remaining
 bottleneck for large-activation training and motivates E6 (caching allocator).
+
+### E6 — Caching device allocator (Tier 1) — *kept (opt-in), confirms the cliff*
+
+Added a size-bucketed device-buffer pool to `TensorRuntime`. **Reuse is always on** (an empty pool
+just falls through to a real allocation); the pool is **fed only by explicit `Tensor.Dispose()`**, so
+default non-disposing code is byte-for-byte unchanged. `Tensor.DisposeGraph()` recycles a step's
+interior forward-activation buffers back to the pool — the deterministic "free the graph" to call
+after backward+step. It stays **opt-in** because Tensotron *retains* graphs by default (supports
+repeated backward), so auto-freeing would break those semantics — same reason PyTorch frees only when
+not retaining. Capped at ~1 GB retained.
+
+**Allocator probe** (`benchpool`, heavy configs, pool-off = no recycle vs pool-on = DisposeGraph/step):
+
+| config | pool-off | pool-on | speedup |
+|---|---|---|---|
+| 1024 × 2048 | 7.3 ms (33 alloc/step) | 6.5 ms (22 alloc/step) | 1.1× |
+| **4096 × 2048** | **~200–3100 ms** (33 alloc/step) | **78 ms** (22 alloc/step) | **~40×** |
+
+The unpooled 4096×2048 figure is *catastrophic and highly variable* (196 ms in the E5 sweep, 3113 ms
+here) — the signature of GC-pressure / `cudaMalloc` thrashing once per-step churn (~1 GB) outpaces the
+GC. Pooling makes it ≈linear. At 1024×2048 the GC keeps up, so the win is small — the allocator matters
+specifically for **large activations / large batch**. (Gradient buffers are *not* recycled — they can
+alias across inputs — so pool-on still shows 22 allocs/step; recycling those too needs ref-counting,
+left as future work.) **Correctness:** new `AllocatorPoolTests` trains the same net with and without
+recycling and requires **bit-identical** parameters; 74/74 tests green.

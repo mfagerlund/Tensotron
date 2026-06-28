@@ -14,6 +14,7 @@ switch (which)
     case "regression": case "reg": RegressionExample.Run(); break;
     case "bench": BenchExample.Run(); break;
     case "benchsweep": case "sweep": BenchExample.Sweep(); break;
+    case "benchpool": case "pool": BenchExample.Pool(); break;
     case "all":
         XorExample.Run();
         SpiralExample.Run();
