@@ -60,21 +60,22 @@ public sealed class Sgd : Optimizer
         foreach (var p in Parameters)
         {
             if (p.Grad == null) continue;
-            var g = p.Grad;
-            if (_weightDecay != 0f) g = Add(g, Mul(p, Scalar(_weightDecay)));
 
+            // Momentum buffer (when used) is allocated once and updated in place by the kernel;
+            // hasBuf=0 on its first step seeds buf=g (matching torch). momentum=0 ⇒ buf unused,
+            // so we pass the grad buffer as a harmless placeholder.
+            Tensor buf;
+            float hasBuf;
             if (_momentum != 0f)
             {
-                Tensor buf;
-                if (!_buf.TryGetValue(p, out buf!))
-                    buf = g.Clone(); // first step: buffer initialized to the gradient
-                else
-                    buf = Add(Mul(buf, Scalar(_momentum)), Mul(g, Scalar(1f - _dampening)));
-                _buf[p] = buf;
-                g = _nesterov ? Add(g, Mul(buf, Scalar(_momentum))) : buf;
+                if (_buf.TryGetValue(p, out buf!)) hasBuf = 1f;
+                else { buf = Tensor.Zeros(p.Shape); _buf[p] = buf; hasBuf = 0f; }
             }
+            else { buf = p.Grad!; hasBuf = 0f; }
 
-            Update(p, Sub(p, Mul(g, Scalar(LearningRate))));
+            TensorRuntime.Instance.LaunchSgd(
+                p.Buffer, p.Grad!.Buffer, buf.Buffer,
+                LearningRate, _momentum, _weightDecay, _dampening, _nesterov ? 1f : 0f, hasBuf);
         }
     });
 }
@@ -97,22 +98,20 @@ public sealed class Adam : Optimizer
         foreach (var p in Parameters)
         {
             if (p.Grad == null) continue;
-            var g = p.Grad;
-            if (_weightDecay != 0f) g = Add(g, Mul(p, Scalar(_weightDecay)));
 
+            // State (m, v) is allocated once and updated IN PLACE by the fused kernel — no
+            // per-step intermediate tensors or scalar uploads (the old path was ~15 ops/param).
             if (!_state.TryGetValue(p, out var s))
                 s = (Tensor.Zeros(p.Shape), Tensor.Zeros(p.Shape), 0);
             int t = s.t + 1;
-            var m = Add(Mul(s.m, Scalar(_b1)), Mul(g, Scalar(1f - _b1)));
-            var v = Add(Mul(s.v, Scalar(_b2)), Mul(Square(g), Scalar(1f - _b2)));
-            _state[p] = (m, v, t);
+            _state[p] = (s.m, s.v, t);
 
-            float bc1 = 1f - MathF.Pow(_b1, t);
-            float bc2 = 1f - MathF.Pow(_b2, t);
-            var mhat = Mul(m, Scalar(1f / bc1));
-            var vhat = Mul(v, Scalar(1f / bc2));
-            var step = Div(mhat, Add(Sqrt(vhat), Scalar(_eps)));
-            Update(p, Sub(p, Mul(step, Scalar(LearningRate))));
+            float invBc1 = 1f / (1f - MathF.Pow(_b1, t));
+            float invBc2 = 1f / (1f - MathF.Pow(_b2, t));
+            TensorRuntime.Instance.LaunchAdam(
+                p.Buffer, p.Grad!.Buffer, s.m.Buffer, s.v.Buffer,
+                _b1, 1f - _b1, _b2, 1f - _b2, LearningRate, _eps, invBc1, invBc2,
+                coupledWd: _weightDecay, decoupledFactor: 1f);
         }
     });
 }
@@ -135,24 +134,20 @@ public sealed class AdamW : Optimizer
         foreach (var p in Parameters)
         {
             if (p.Grad == null) continue;
-            var g = p.Grad;
-
-            // decoupled decay: p <- p * (1 - lr*wd) before the Adam step.
-            var pd = _weightDecay != 0f ? Mul(p, Scalar(1f - LearningRate * _weightDecay)) : p;
 
             if (!_state.TryGetValue(p, out var s))
                 s = (Tensor.Zeros(p.Shape), Tensor.Zeros(p.Shape), 0);
             int t = s.t + 1;
-            var m = Add(Mul(s.m, Scalar(_b1)), Mul(g, Scalar(1f - _b1)));
-            var v = Add(Mul(s.v, Scalar(_b2)), Mul(Square(g), Scalar(1f - _b2)));
-            _state[p] = (m, v, t);
+            _state[p] = (s.m, s.v, t);
 
-            float bc1 = 1f - MathF.Pow(_b1, t);
-            float bc2 = 1f - MathF.Pow(_b2, t);
-            var mhat = Mul(m, Scalar(1f / bc1));
-            var vhat = Mul(v, Scalar(1f / bc2));
-            var step = Div(mhat, Add(Sqrt(vhat), Scalar(_eps)));
-            Update(p, Sub(pd, Mul(step, Scalar(LearningRate))));
+            float invBc1 = 1f / (1f - MathF.Pow(_b1, t));
+            float invBc2 = 1f / (1f - MathF.Pow(_b2, t));
+            // Decoupled decay p <- p·(1 − lr·wd) is folded into the fused kernel's factor.
+            float decoupled = _weightDecay != 0f ? 1f - LearningRate * _weightDecay : 1f;
+            TensorRuntime.Instance.LaunchAdam(
+                p.Buffer, p.Grad!.Buffer, s.m.Buffer, s.v.Buffer,
+                _b1, 1f - _b1, _b2, 1f - _b2, LearningRate, _eps, invBc1, invBc2,
+                coupledWd: 0f, decoupledFactor: decoupled);
         }
     });
 }

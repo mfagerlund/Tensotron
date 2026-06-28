@@ -13,13 +13,14 @@ switch (which)
     case "spiral": SpiralExample.Run(); break;
     case "regression": case "reg": RegressionExample.Run(); break;
     case "bench": BenchExample.Run(); break;
+    case "benchsweep": case "sweep": BenchExample.Sweep(); break;
     case "all":
         XorExample.Run();
         SpiralExample.Run();
         RegressionExample.Run();
         break;
     default:
-        Console.WriteLine($"Unknown example '{which}'. Try: xor | spiral | regression | bench | all");
+        Console.WriteLine($"Unknown example '{which}'. Try: xor | spiral | regression | bench | benchsweep | all");
         Environment.ExitCode = 1;
         break;
 }

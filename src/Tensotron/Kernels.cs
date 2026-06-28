@@ -1,4 +1,5 @@
 using ILGPU;
+using ILGPU.Algorithms;
 
 namespace Tensotron;
 
@@ -77,6 +78,51 @@ internal static class Kernels
     public static void AddInto(Index1D i, ArrayView<float> target, ArrayView<float> source)
     {
         target[i] += source[i];
+    }
+
+    /// <summary>
+    /// Fused Adam / AdamW parameter update — one launch per parameter, fully in place, no
+    /// intermediate buffers or scalar uploads (replaces ~15 element-wise ops + ~8 host→device
+    /// scalar copies per parameter). Mutates m, v, p; reads g. Serves both variants:
+    ///   Adam : coupledWd = weight_decay,           decoupledFactor = 1
+    ///   AdamW: coupledWd = 0,                       decoupledFactor = 1 − lr·weight_decay
+    /// Bias corrections are folded into invBc1 = 1/(1−β1ᵗ), invBc2 = 1/(1−β2ᵗ) host-side.
+    /// </summary>
+    public static void AdamStep(
+        Index1D i,
+        ArrayView<float> p, ArrayView<float> g, ArrayView<float> m, ArrayView<float> v,
+        float b1, float oneMinusB1, float b2, float oneMinusB2,
+        float lr, float eps, float invBc1, float invBc2,
+        float coupledWd, float decoupledFactor)
+    {
+        float pi = p[i];
+        float gi = g[i] + coupledWd * pi;            // coupled L2 (0 for AdamW)
+        float mi = b1 * m[i] + oneMinusB1 * gi;
+        float vi = b2 * v[i] + oneMinusB2 * gi * gi;
+        m[i] = mi;
+        v[i] = vi;
+        float step = (mi * invBc1) / (XMath.Sqrt(vi * invBc2) + eps);
+        p[i] = pi * decoupledFactor - lr * step;     // decoupled decay folded into the factor
+    }
+
+    /// <summary>
+    /// Fused SGD update with optional momentum / weight decay / dampening / Nesterov — one launch
+    /// per parameter, in place. <paramref name="hasBuf"/>=0 on the first momentum step seeds buf=g
+    /// (matching torch); otherwise buf is updated in place. momentum=0 ⇒ buf is untouched.
+    /// </summary>
+    public static void SgdStep(
+        Index1D i,
+        ArrayView<float> p, ArrayView<float> g, ArrayView<float> buf,
+        float lr, float momentum, float weightDecay, float dampening, float nesterov, float hasBuf)
+    {
+        float gi = g[i] + weightDecay * p[i];        // weightDecay 0 ⇒ no-op
+        if (momentum != 0f)
+        {
+            float b = hasBuf != 0f ? momentum * buf[i] + (1f - dampening) * gi : gi;
+            buf[i] = b;
+            gi = nesterov != 0f ? gi + momentum * b : b;
+        }
+        p[i] = p[i] - lr * gi;
     }
 
     /// <summary>

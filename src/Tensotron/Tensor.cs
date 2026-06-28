@@ -123,6 +123,7 @@ public sealed partial class Tensor : IDisposable
         if (shape.Size != data.Length)
             throw new InvalidOperationException($"Data length {data.Length} != shape size {shape.Size} {shape}.");
         var t = Allocate(shape);
+        Runtime.NoteHostUpload();
         t.Buffer.CopyFromCPU(data);
         return t;
     }
@@ -142,6 +143,7 @@ public sealed partial class Tensor : IDisposable
         if (shape.Size != data.Length)
             throw new InvalidOperationException($"Data length {data.Length} != shape size {shape.Size} {shape}.");
         var t = Allocate(shape);
+        Runtime.NoteHostUpload();
         t.Buffer.CopyFromCPU(data);
         return t;
     }
@@ -149,6 +151,7 @@ public sealed partial class Tensor : IDisposable
     public static Tensor Zeros(Shape shape)
     {
         var t = Allocate(shape);
+        Runtime.NoteHostUpload();
         t.Buffer.CopyFromCPU(new float[shape.Size]);
         return t;
     }
@@ -156,6 +159,7 @@ public sealed partial class Tensor : IDisposable
     public static Tensor Ones(Shape shape)
     {
         var t = Allocate(shape);
+        Runtime.NoteHostUpload();
         var ones = new float[shape.Size];
         Array.Fill(ones, 1f);
         t.Buffer.CopyFromCPU(ones);
@@ -214,6 +218,7 @@ public sealed partial class Tensor : IDisposable
     {
         if (data.Length != Shape.Size)
             throw new InvalidOperationException($"CopyFromHost length {data.Length} != {Shape.Size} {Shape}.");
+        Runtime.NoteHostUpload();
         Buffer.CopyFromCPU(data);
     }
 

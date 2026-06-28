@@ -85,6 +85,10 @@ public sealed class TensorRuntime : IDisposable
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<int>> _maxPool2dGrad;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<int>> _avgPool2d;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<int>> _avgPool2dGrad;
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+        float, float, float, float, float, float, float, float, float, float> _adamStep;
+    private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+        float, float, float, float, float, float> _sgdStep;
 
     private TensorRuntime()
     {
@@ -157,6 +161,13 @@ public sealed class TensorRuntime : IDisposable
             Index1D, ArrayView<float>, ArrayView<float>, ArrayView<int>>(Kernels.AvgPool2d);
         _avgPool2dGrad = Accelerator.LoadAutoGroupedStreamKernel<
             Index1D, ArrayView<float>, ArrayView<float>, ArrayView<int>>(Kernels.AvgPool2dGrad);
+
+        _adamStep = Accelerator.LoadAutoGroupedStreamKernel<
+            Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+            float, float, float, float, float, float, float, float, float, float>(Kernels.AdamStep);
+        _sgdStep = Accelerator.LoadAutoGroupedStreamKernel<
+            Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+            float, float, float, float, float, float>(Kernels.SgdStep);
     }
 
     private static Device SelectDevice(Context ctx, TensorBackend backend)
@@ -173,8 +184,21 @@ public sealed class TensorRuntime : IDisposable
         return pick ?? ctx.GetPreferredDevice(preferCPU: false);
     }
 
+    // ---- lightweight instrumentation (perf bench only; negligible when unread) ----
+    /// <summary>Kernel launches + device copies issued (each <see cref="AfterLaunch"/>).</summary>
+    public long Launches { get; private set; }
+    /// <summary>Device buffer allocations (float results + int stride/dim buffers).</summary>
+    public long Allocs { get; private set; }
+    /// <summary>Host→device uploads (scalar/leaf CopyFromCPU + per-launch stride buffers).</summary>
+    public long HostUploads { get; private set; }
+    public void ResetCounters() { Launches = 0; Allocs = 0; HostUploads = 0; }
+    internal void NoteHostUpload() => HostUploads++;
+
     public MemoryBuffer1D<float, Stride1D.Dense> Allocate(int length)
-        => Accelerator.Allocate1D<float>(length);
+    {
+        Allocs++;
+        return Accelerator.Allocate1D<float>(length);
+    }
 
     // ---- async batching ----
     // Kernels launch on the accelerator's in-order default stream and are NOT synced per
@@ -191,6 +215,8 @@ public sealed class TensorRuntime : IDisposable
     // a zero-length view. The kernels take an explicit `rank`, so padded content is unused.
     private MemoryBuffer1D<int, Stride1D.Dense> AllocInt(int[] a)
     {
+        Allocs++;
+        HostUploads++;
         var buf = Accelerator.Allocate1D(a.Length == 0 ? new[] { 0 } : a);
         _pendingInts.Add(buf);
         return buf;
@@ -199,6 +225,7 @@ public sealed class TensorRuntime : IDisposable
     // Called after every async launch: drain + free parked buffers once enough work queues.
     private void AfterLaunch()
     {
+        Launches++;
         if (++_opsSinceSync >= FlushEvery) Drain();
     }
 
@@ -568,6 +595,33 @@ public sealed class TensorRuntime : IDisposable
     {
         var dCfg = AllocInt(cfg);
         _avgPool2dGrad((int)g.Length, g.View, gx.View, dCfg.View);
+        AfterLaunch();
+    }
+
+    /// <summary>Fused Adam/AdamW update (in place). See <see cref="Kernels.AdamStep"/>.</summary>
+    public void LaunchAdam(
+        MemoryBuffer1D<float, Stride1D.Dense> p,
+        MemoryBuffer1D<float, Stride1D.Dense> g,
+        MemoryBuffer1D<float, Stride1D.Dense> m,
+        MemoryBuffer1D<float, Stride1D.Dense> v,
+        float b1, float oneMinusB1, float b2, float oneMinusB2,
+        float lr, float eps, float invBc1, float invBc2,
+        float coupledWd, float decoupledFactor)
+    {
+        _adamStep((int)p.Length, p.View, g.View, m.View, v.View,
+            b1, oneMinusB1, b2, oneMinusB2, lr, eps, invBc1, invBc2, coupledWd, decoupledFactor);
+        AfterLaunch();
+    }
+
+    /// <summary>Fused SGD update (in place). See <see cref="Kernels.SgdStep"/>.</summary>
+    public void LaunchSgd(
+        MemoryBuffer1D<float, Stride1D.Dense> p,
+        MemoryBuffer1D<float, Stride1D.Dense> g,
+        MemoryBuffer1D<float, Stride1D.Dense> buf,
+        float lr, float momentum, float weightDecay, float dampening, float nesterov, float hasBuf)
+    {
+        _sgdStep((int)p.Length, p.View, g.View, buf.View,
+            lr, momentum, weightDecay, dampening, nesterov, hasBuf);
         AfterLaunch();
     }
 
