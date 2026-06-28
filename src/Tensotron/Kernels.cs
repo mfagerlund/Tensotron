@@ -687,6 +687,47 @@ internal static class Kernels
         c[m * N + n] = acc;
     }
 
+    public const int MatMulTile = 16;
+
+    /// <summary>
+    /// Tiled shared-memory GEMM — same explicit-stride contract as <see cref="MatMul2D"/>
+    /// (so transposes stay stride swaps and the backward is unchanged), but each TILE×TILE
+    /// output block is computed by a thread group that stages A/B tiles into shared memory,
+    /// giving each loaded element TILE reuses instead of re-reading global memory. Output C is
+    /// contiguous (M,N). Explicitly grouped: launch with a (⌈N/TILE⌉,⌈M/TILE⌉)×(TILE,TILE) config.
+    /// Computes C[m,n] = Σ_k A[m·aMs + k·aKs] · B[n·bNs + k·bKs].
+    /// </summary>
+    public static void MatMul2DTiled(
+        ArrayView<float> a, ArrayView<float> b, ArrayView<float> c,
+        int M, int N, int K, int aMs, int aKs, int bKs, int bNs)
+    {
+        const int TS = MatMulTile;
+        var As = SharedMemory.Allocate<float>(TS * TS);
+        var Bs = SharedMemory.Allocate<float>(TS * TS);
+
+        int tx = Group.IdxX, ty = Group.IdxY;     // thread within the tile (x→n, y→m)
+        int row = Grid.IdxY * TS + ty;            // output row m
+        int col = Grid.IdxX * TS + tx;            // output col n
+
+        float acc = 0f;
+        int tiles = (K + TS - 1) / TS;
+        for (int t = 0; t < tiles; t++)
+        {
+            int kA = t * TS + tx;                 // this thread stages A[row, kA]
+            int kB = t * TS + ty;                 //   and B[kB, col]
+            As[ty * TS + tx] = (row < M && kA < K) ? a[row * aMs + kA * aKs] : 0f;
+            Bs[ty * TS + tx] = (col < N && kB < K) ? b[col * bNs + kB * bKs] : 0f;
+            Group.Barrier();
+
+            for (int k = 0; k < TS; k++)
+                acc += As[ty * TS + k] * Bs[k * TS + tx];
+            Group.Barrier();
+        }
+
+        if (row < M && col < N)
+            c[row * N + col] = acc;
+    }
+
     // pool config layout (single int buffer):
     //   [0]N [1]C [2]H [3]W [4]kh [5]kw [6]sh [7]sw [8]ph [9]pw [10]dh [11]dw [12]Hout [13]Wout
     private static void DecodePoolIndex(int i, ArrayView<int> cfg,

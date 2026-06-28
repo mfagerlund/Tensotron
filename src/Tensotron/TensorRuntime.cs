@@ -69,6 +69,8 @@ public sealed class TensorRuntime : IDisposable
         ArrayView<int>, ArrayView<int>, ArrayView<int>, ArrayView<int>> _reduceSum;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
         int, int, int, int, int, int, int> _matmul;
+    private readonly Action<KernelConfig, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+        int, int, int, int, int, int, int> _matmulTiled;
     private readonly Action<Index1D, int, ArrayView<float>, ArrayView<float>,
         ArrayView<int>, ArrayView<int>, int> _stridedCopy;
     private readonly Action<Index1D, int, ArrayView<float>, ArrayView<float>,
@@ -125,6 +127,10 @@ public sealed class TensorRuntime : IDisposable
         _matmul = Accelerator.LoadAutoGroupedStreamKernel<
             Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
             int, int, int, int, int, int, int>(Kernels.MatMul2D);
+
+        _matmulTiled = Accelerator.LoadStreamKernel<
+            ArrayView<float>, ArrayView<float>, ArrayView<float>,
+            int, int, int, int, int, int, int>(Kernels.MatMul2DTiled);
 
         _reduceArg = Accelerator.LoadAutoGroupedStreamKernel<
             Index1D, int, ArrayView<float>, ArrayView<float>,
@@ -434,7 +440,19 @@ public sealed class TensorRuntime : IDisposable
         int M, int N, int K,
         int aMs, int aKs, int bKs, int bNs)
     {
-        _matmul(M * N, a.View, b.View, c.View, M, N, K, aMs, aKs, bKs, bNs);
+        // Tiled shared-memory GEMM for the compute-bound regime; the naive one-thread-per-output
+        // kernel for small/skinny products where tiling's masked threads aren't worth it.
+        const int TS = Kernels.MatMulTile;
+        if (M >= 64 && N >= 64 && K >= 64)
+        {
+            var grid = new Index3D((N + TS - 1) / TS, (M + TS - 1) / TS, 1);
+            var group = new Index3D(TS, TS, 1);
+            _matmulTiled(new KernelConfig(grid, group), a.View, b.View, c.View, M, N, K, aMs, aKs, bKs, bNs);
+        }
+        else
+        {
+            _matmul(M * N, a.View, b.View, c.View, M, N, K, aMs, aKs, bKs, bNs);
+        }
         AfterLaunch();
     }
 

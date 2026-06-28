@@ -72,3 +72,41 @@ The ~49 eliminated host→device transfers/step were **blocking the async stream
 another 5.5×, and incidentally sped the whole test suite ~16×. **Cumulative: 72.3 → ~2.0 ms/step,
 ≈35×.** Correctness: 69/69 green. Variance is now GPU-clock jitter (absolute times are sub-millisecond
 per phase). Remaining per step: 42 launches, 39 allocs, 3 uploads — now genuinely compute/launch bound.
+
+**Size sweep after E2** (inDim 64, depth 2; ms/step). Launch/alloc counts are constant at 42/39
+across *all* sizes — overhead is size-independent, so small nets sit on a ~1.5 ms launch-overhead
+floor while large nets are dominated by the naive GEMM:
+
+| batch \ width | 128 | 512 | 2048 |
+|---|---|---|---|
+| 64   | 1.56 | 1.68 | 4.54 |
+| 256  | 1.48 | 2.35 | 16.08 |
+| 1024 | 2.49 | 7.11 | **46.24** |
+| 4096 | 8.09 | 15.58 | (naive GEMM ≳150) |
+
+**Conclusion:** two distinct regimes. Small/medium nets → launch-bound (≈1.5 ms floor, attack launch
+*count*). Large nets → **the naive one-thread-per-output GEMM is the entire bottleneck** (attack the
+matmul kernel). Next experiments target both: a faster GEMM (tiled / cuBLAS) and launch-count cuts.
+
+### E3 — Tiled shared-memory GEMM (Tier 3) — *kept*
+
+Added `Kernels.MatMul2DTiled`: a 16×16 tiled SGEMM that stages A/B tiles into shared memory (each
+loaded element reused 16×, vs the naive kernel re-reading global memory per MAC). Keeps the **exact
+explicit-stride contract** of `MatMul2D`, so transposes stay stride-swaps and the autograd backward
+is unchanged. Dispatched from `LaunchMatMul` only when M,N,K ≥ 64 (tiling's masked threads aren't
+worth it for small/skinny products — those keep the naive kernel). New test `TiledMatMulTests`
+verifies forward **and** both transposed-stride gradients (dA=W·Bᵀ, dB=Aᵀ·W) against a CPU reference,
+with non-multiple-of-16 dims to exercise boundary masking.
+
+Sweep, naive → tiled ms/step (compute-bound rows):
+
+| batch × width | naive | tiled | speedup |
+|---|---|---|---|
+| 1024 × 512 | 7.11 | 4.43 | 1.6× |
+| 4096 × 512 | 15.58 | 9.90 | 1.6× |
+| 256 × 2048 | 16.08 | 9.00 | 1.8× |
+| **1024 × 2048** | **46.24** | **14.79** | **3.1×** |
+
+Small/launch-bound rows are unchanged (within jitter). **Correctness:** 70/70 green (new test added).
+A basic tile (no register blocking) reaches ~2–3× of naive; the open question is whether cuBLAS
+(tensor cores / TF32) does materially better — tested next (E4).
