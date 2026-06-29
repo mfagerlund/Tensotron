@@ -48,13 +48,29 @@ public abstract class TensorRuntime : IDisposable
     private static readonly Lazy<TensorRuntime> _instance = new(Create);
     public static TensorRuntime Instance => _instance.Value;
 
+    private static TensorBackend _requestedBackend = ParseBackendEnv();
+
     /// <summary>
     /// Backend to use, read once when the runtime is first created. Set this before touching any
     /// tensor, or set the <c>TENSOTRON_BACKEND</c> env var (auto|cuda|cpu|simd). Tensotron runs on
     /// exactly one backend process-wide, so — like PyTorch's device model — tensors never mix
-    /// backends; selecting here picks that single backend.
+    /// backends; selecting here picks that single backend. Throws if changed after the runtime has
+    /// already been created (the choice is latched on the first tensor op), rather than silently
+    /// ignoring the new value.
     /// </summary>
-    public static TensorBackend RequestedBackend { get; set; } = ParseBackendEnv();
+    public static TensorBackend RequestedBackend
+    {
+        get => _requestedBackend;
+        set
+        {
+            if (_instance.IsValueCreated && value != _requestedBackend)
+                throw new InvalidOperationException(
+                    $"RequestedBackend cannot be changed to {value}: the runtime was already " +
+                    $"initialized as {_requestedBackend} on the first tensor op. Set RequestedBackend " +
+                    "(or the TENSOTRON_BACKEND env var) before touching any tensor.");
+            _requestedBackend = value;
+        }
+    }
 
     private static TensorBackend ParseBackendEnv() =>
         (Environment.GetEnvironmentVariable("TENSOTRON_BACKEND")?.Trim().ToLowerInvariant()) switch

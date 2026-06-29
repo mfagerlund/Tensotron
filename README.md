@@ -81,7 +81,7 @@ dotnet run --project examples/Tensotron.Examples spiral     # 3-class spiral →
 dotnet run --project examples/Tensotron.Examples regression # noisy sine fit → regression.svg
 ```
 
-No GPU needed (CPU-accelerator fallback). The spiral and regression demos write an SVG you
+No GPU needed (managed/SIMD CPU backend fallback). The spiral and regression demos write an SVG you
 can open in a browser. See [examples/README.md](examples/README.md).
 
 ## Design
@@ -201,7 +201,7 @@ networks — each implemented op passing forward **and** backward torch-parity t
 uses the stride-swap transpose trick (no transpose copies); broadcast gradients reduce correctly.
 (For what's *not* implemented, see **Scope** above.)
 
-What's landed (every listed op parity-tested against PyTorch):
+What's landed (every deterministic op forward+backward parity-tested against PyTorch; the one stochastic op, `dropout`, is property-tested — scaling, drop-rate, gradient masking — since it can't be golden-fixtured):
 
 - **Core ops** — add/sub/mul/div, unary math + activations (relu/tanh/sigmoid/gelu/exp/log/sqrt/…), broadcasting, reductions (sum/mean/var/std/min/max/argmin/argmax/prod). `Gelu` defaults to the exact-erf form (torch's default `nn.GELU()`); the tanh approximation is opt-in via `Gelu(x, approximateTanh: true)`.
 - **Linear algebra** — 2D matmul and N-D batched matmul with broadcast batch dims.

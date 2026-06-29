@@ -23,15 +23,15 @@ jobs:
       - name: Build
         run: dotnet build Tensotron.sln --configuration Release
 
-      # CI runners have no CUDA GPU. The parity suite still runs in full on the CPU backend; the
-      # slow GPU-only Showcase convergence demos are filtered out (they SkippableFact-skip anyway).
-      - name: Test (default backend)
-        run: dotnet test Tensotron.sln --configuration Release --no-build --filter "Category!=Showcase"
-
-      - name: Test (managed SIMD backend)
+      # GitHub runners have no CUDA GPU, so the runtime's Auto backend resolves to the managed
+      # SIMD CPU backend — the op-parity suite runs in full there. The ILGPU device-internal test
+      # classes (trace/replay, allocator-pool, device-probe, tiled-GEMM, cuBLAS-batched) need a
+      # real ILGPU accelerator and are excluded, exactly mirroring tools/run-tests.ps1 -Simd. The
+      # slow GPU-only Showcase convergence demos SkippableFact-skip without CUDA.
+      - name: Test (managed SIMD CPU backend)
         env:
           TENSOTRON_BACKEND: simd
-        run: dotnet test Tensotron.sln --configuration Release --no-build --filter "Category!=Showcase"
+        run: dotnet test Tensotron.sln --configuration Release --no-build --filter "FullyQualifiedName!~TraceReplay&FullyQualifiedName!~AllocatorPool&FullyQualifiedName!~Device&FullyQualifiedName!~TiledMatMul&FullyQualifiedName!~BatchedCuBlas&Category!=Showcase"
 
       - name: Pack (verify the NuGet package builds)
         run: dotnet pack src/Tensotron/Tensotron.csproj --configuration Release --no-build

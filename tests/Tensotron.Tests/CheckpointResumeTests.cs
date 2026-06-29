@@ -5,10 +5,11 @@ namespace Tensotron.Tests;
 
 /// <summary>
 /// Mid-training checkpoint must capture EVERYTHING needed to resume identically: model parameters,
-/// persistent buffers (BatchNorm running mean/var), optimizer state (Adam moments + step), and LR
-/// scheduler state (CosineAnnealingLR epoch). Strategy: train a model, save, keep training the
-/// original AND a freshly-reloaded copy for two more deterministic steps, then assert they stayed
-/// equal. Any state that wasn't serialized makes the copy diverge and fails the test.
+/// persistent buffers (BatchNorm running mean/var), optimizer state (Adam moments / SGD &amp; RMSprop
+/// buffers + step), and LR-scheduler state (the epoch counter). Strategy: train a model, save, keep
+/// training the original AND a freshly-reloaded copy for two more deterministic steps, then assert
+/// they stayed equal. Any state that wasn't serialized makes the copy diverge and fails the test.
+/// Run across several optimizer + scheduler combos so the round-trip isn't secretly Adam-specific.
 /// </summary>
 public class CheckpointResumeTests
 {
@@ -44,17 +45,33 @@ public class CheckpointResumeTests
     }
 
     [Fact]
-    public void Checkpoint_ResumesTraining_Identically()
+    public void Checkpoint_ResumesTraining_Identically_Adam_Cosine()
+        => RunResumeTest(ps => new Adam(ps, lr: 0.1f), o => new CosineAnnealingLR(o, tMax: 20));
+
+    // SGD momentum buffer + a step-decay schedule: a different optimizer-state shape and a
+    // non-cosine scheduler, so the round-trip isn't secretly Adam/Cosine-specific.
+    [Fact]
+    public void Checkpoint_ResumesTraining_Identically_SgdMomentum_StepLR()
+        => RunResumeTest(ps => new Sgd(ps, lr: 0.02f, momentum: 0.9f), o => new StepLR(o, stepSize: 2, gamma: 0.5f));
+
+    // RMSprop square-avg + momentum buffers + an exponential schedule.
+    [Fact]
+    public void Checkpoint_ResumesTraining_Identically_RmsPropMomentum_ExponentialLR()
+        => RunResumeTest(ps => new RmsProp(ps, lr: 0.01f, momentum: 0.9f), o => new ExponentialLR(o, gamma: 0.9f));
+
+    private static void RunResumeTest(
+        Func<IReadOnlyList<Tensor>, Optimizer> makeOpt,
+        Func<Optimizer, LrScheduler> makeSched)
     {
         Init.Seed(7);
         var model = MakeModel();
-        // Large LR so any missing Adam/scheduler state diverges by >> the comparison tolerance.
-        var opt = new Adam(model.Parameters().ToList(), lr: 0.1f);
-        var sched = new CosineAnnealingLR(opt, tMax: 20);
+        // Largeish LR + momentum so any missing optimizer/scheduler state diverges >> the tolerance.
+        var opt = makeOpt(model.Parameters().ToList());
+        var sched = makeSched(opt);
         var (x, y) = Batch();
 
-        // Train enough that Adam moments, BN running stats, and the cosine epoch are all well away
-        // from their init defaults before checkpointing.
+        // Train enough that optimizer buffers, BN running stats, and the scheduler epoch are all
+        // well away from their init defaults before checkpointing.
         for (int i = 0; i < 6; i++) TrainStep(model, opt, sched, x, y);
 
         var path = Path.Combine(Path.GetTempPath(), $"tensotron_ckpt_{Guid.NewGuid():N}.tns");
@@ -62,12 +79,12 @@ public class CheckpointResumeTests
         {
             Serialization.SaveCheckpoint(model, opt, sched, path);
 
-            // Reload into a FRESH model+opt+sched built with a DIFFERENT init seed — the checkpoint
-            // must overwrite all of it.
+            // Reload into a FRESH model+opt+sched built with a DIFFERENT init seed but the ORIGINAL
+            // base LR (the documented resume contract) — the checkpoint must overwrite all of it.
             Init.Seed(999);
             var model2 = MakeModel();
-            var opt2 = new Adam(model2.Parameters().ToList(), lr: 0.1f);
-            var sched2 = new CosineAnnealingLR(opt2, tMax: 20);
+            var opt2 = makeOpt(model2.Parameters().ToList());
+            var sched2 = makeSched(opt2);
             Serialization.LoadCheckpoint(model2, opt2, sched2, path);
 
             // Continue BOTH for two more identical, deterministic steps.
@@ -81,8 +98,8 @@ public class CheckpointResumeTests
             Assert.True(MathF.Abs(opt.LearningRate - opt2.LearningRate) < 1e-6f,
                 $"LR drift: {opt.LearningRate} vs {opt2.LearningRate}");
 
-            // (2) Parameters equal -> params + Adam moments restored. NOTE: training-mode BatchNorm
-            // normalizes with BATCH stats, so this assertion alone does NOT exercise running stats.
+            // (2) Parameters equal -> params + optimizer moments/buffers restored. NOTE: training-mode
+            // BatchNorm normalizes with BATCH stats, so this alone does NOT exercise running stats.
             var pa = model.NamedParameters().ToDictionary(p => p.name, p => p.param);
             var pb = model2.NamedParameters().ToDictionary(p => p.name, p => p.param);
             Assert.Equal(pa.Keys.OrderBy(k => k), pb.Keys.OrderBy(k => k));

@@ -14,7 +14,7 @@ A **PyTorch-faithful**, float32 tensor and autograd library for .NET, GPU-accele
 ## Highlights
 
 - **Define-by-run autograd** - toposort backward over a named op graph; `Tensor.Backward()`.
-- **Broad op surface, every implemented op torch-parity tested** - elementwise math + activations,
+- **Broad op surface, every deterministic op torch-parity tested** - elementwise math + activations,
   broadcasting, reductions, 2D/N-D batched matmul, movement/structure ops, indexing
   (`gather`/`scatter_add`/`index_select`), `Conv2d`, `MaxPool2d`/`AvgPool2d`, LayerNorm /
   BatchNorm / GroupNorm, and the common losses (MSE, L1, Huber, BCE-with-logits, NLL,
@@ -42,7 +42,7 @@ op every step) is the remaining cost for very small models — measured ~95% hos
 an opt-in escape hatch: `TensorRuntime.Capture`/`CapturedGraph.Replay` records a fixed-shape step
 once and replays its device launches buffer-to-buffer (~2.5–2.9× on a small step; spike). Still
 unoptimized: cross-op kernel fusion. float32-only *storage* by design (so no FP16/BF16 path), but TF32 tensor-core
-matmul is an available one-line knob (`CuBlas.MathMode`), currently left off for exact FP32.
+matmul is an available one-line knob (`TensorRuntime.AllowTf32`), currently left off for exact FP32.
 
 ## Quick start
 
