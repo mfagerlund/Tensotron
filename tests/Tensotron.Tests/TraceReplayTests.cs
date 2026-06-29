@@ -62,7 +62,7 @@ public class TraceReplayTests
 
     // The capture-time "untapped op" guard must fire (not silently corrupt) if a captured body uses
     // an op that does not record a replay thunk. MaxPool2d allocates a data-dependent argmax index
-    // buffer and is intentionally not trace-supported in the spike.
+    // buffer and is intentionally not trace-supported.
     [Fact]
     public void Capture_throws_on_unsupported_op()
     {

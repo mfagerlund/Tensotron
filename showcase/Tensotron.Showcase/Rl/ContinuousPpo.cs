@@ -37,11 +37,11 @@ public sealed class ContinuousPpo
         _rng = rng;
         _opt = new Adam(ac.Parameters(), lr: LearningRate);
 
-        // A single minibatch update (3-layer MLP forward+backward + PPO loss + clip + Adam)
-        // is well under 1024 launches and makes no host pull, so the every-64 safety drain was
-        // the only thing syncing mid-update. Raise it to span a whole update — drains still
-        // fire across minibatches, keeping the in-flight queue bounded. Pure MLP: no parked
-        // data-dependent index buffers, so nothing accumulates between drains.
+        // A single minibatch update (3-layer MLP forward+backward + PPO loss + clip + Adam) is
+        // well under 1024 launches and makes no host pull. FlushEvery=1024 spans a whole update so
+        // the safety drain doesn't sync mid-update; drains still fire across minibatches, keeping
+        // the in-flight queue bounded. Pure MLP: no parked data-dependent index buffers, so nothing
+        // accumulates between drains.
         TensorRuntime.Instance.FlushEvery = 1024;
     }
 

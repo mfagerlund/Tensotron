@@ -5,10 +5,8 @@ public static partial class TensorOps
     /// <summary>
     /// y = a · bᵀ computed directly from the explicit-stride matmul, WITHOUT materializing bᵀ.
     /// This is the matmul `torch.nn.functional.linear` needs (a:(M,K) inputs, b:(N,K) weight →
-    /// y:(M,N)). The old `Linear` did `MatMul(x, weight.T())`, which copied the transposed weight
-    /// into a fresh contiguous buffer every forward (and ran a Permute every backward); here both
-    /// operands are read through strides, so no transpose copy ever happens. Backward mirrors
-    /// MatMul2D's stride-only transposes:
+    /// y:(M,N)). Both operands are read through strides, so no transpose copy is ever
+    /// materialized. Backward mirrors MatMul2D's stride-only transposes:
     ///   da = g · b      (M,K)
     ///   db = gᵀ · a     (N,K)
     /// </summary>

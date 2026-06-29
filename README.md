@@ -1,35 +1,20 @@
 # Tensotron
 
-Tensotron is a GPU tensor and autograd library for .NET, built on **ILGPU** with **float32** storage: a principled, PyTorch-faithful tensor library whose tensors live on the device.
-
-> **Current backend status.** The async-stream runtime, caching allocator, and cuBLAS GEMM
-> described in *Design* below are **now implemented**, not aspirational. Large matmuls run on
-> cuBLAS SGEMM (vendor-tuned); kernels launch on ILGPU's in-order default stream and the runtime
-> `Synchronize()`s **only** at host pulls (plus a periodic safety drain), not after every launch;
-> freed device buffers are pooled and shape/stride metadata is uploaded once and cached. The per-op
-> host-side graph rebuild (a fresh `Tensor`/`GradNode` per op every step) — measured as the dominant
-> tiny-model cost — now has an opt-in escape hatch: `TensorRuntime.Capture`/`CapturedGraph.Replay`
-> records a fixed-shape step once and replays it buffer-to-buffer (~2.5–2.9× on a small step; spike).
-> Still correctness-first / unoptimized: cross-op kernel fusion. See *Status* → *Next*.
-
-> **CPU backend.** There is now a hand-written, ILGPU-free managed/SIMD CPU backend
-> (`TENSOTRON_BACKEND=simd`) for small-model CPU inference/training: tensors live in `float[]` and
-> every op runs as a synchronous managed (scalar + `Vector<float>` matmul) kernel — no per-op device
-> dispatch. It passes the **same** torch-fixture parity suite (`tools/run-tests.ps1 -Simd`). It takes
-> batch-1 control-net inference from **6.8 ms** (ILGPU's *scalar* CPUAccelerator, dominated by
-> dispatch) to **~10 µs** (~645×), and at batch≥8 beats hand-written scalar C#. Its matmul has
-> **opt-in row parallelism** (`TENSOTRON_CPU_THREADS=auto`) — ~5–12× on big-batch GEMMs for a single
-> trainer on idle cores, off by default because it oversubscribes when many agents already saturate
-> the cores (see the progress doc for the measured curve).
-> **`Auto` (the default) now falls back to this SIMD backend when no CUDA GPU is present** — not to
-> the slow ILGPU CPU accelerator. That ILGPU `cpu` accelerator is kept *only* as a
-> correctness/verification reference (`TENSOTRON_BACKEND=cpu`); selecting it prints a loud warning,
-> because it is ~600× slower than the managed path at batch-1. See [`docs/CPU_SIMD_BACKEND_PLAN.md`](docs/CPU_SIMD_BACKEND_PLAN.md)
-> and [`docs/CPU_SIMD_BACKEND_PROGRESS.md`](docs/CPU_SIMD_BACKEND_PROGRESS.md).
+A **PyTorch-faithful** tensor and autograd library for .NET, **float32** throughout. It runs on **CUDA** (via ILGPU + cuBLAS) when a GPU is present, or a hand-written **managed/SIMD CPU** backend when one isn't — same op surface, same torch-parity tests either way.
 
 > **The law:** for every op it implements, Tensotron matches PyTorch exactly — naming, semantics, broadcasting, gradients (down to behavior at kinks, ties, and special values). If an implemented op doesn't behave like PyTorch, it's a bug. Converting PyTorch code to Tensotron is near-mechanical *within the supported surface* — which is a deliberate subset of torch, not a full reimplementation (see **Scope** below).
 
 > **Scope.** Tensotron targets feed-forward training and inference — MLPs, CNNs, and small RL policy/value nets. **Not implemented** (yet): recurrent layers (RNN/LSTM/GRU), attention / transformer blocks, `Embedding`, `ConvTranspose`, `Conv1d`/`Conv3d`, a dtype system beyond float32, and PyTorch `state_dict`/`safetensors` interop. If your model is sequence- or transformer-shaped, this isn't (yet) the library for it.
+
+## Backends
+
+One backend runs per process, selected by `Auto` (the default) or the `TENSOTRON_BACKEND` env var:
+
+- **CUDA** (`cuda`) — ILGPU kernels on an async in-order stream, with large matmuls on cuBLAS SGEMM. The stream synchronizes only at host pulls (`ToArray`/`Item`), not per launch.
+- **Managed/SIMD CPU** (`simd`) — tensors are `float[]` and every op is a synchronous managed kernel with a `Vector<float>` matmul and no per-op device dispatch. The fast CPU path for small-model inference and training; its matmul has opt-in row parallelism (`TENSOTRON_CPU_THREADS=auto`). At batch-1 it is ~645× faster than the ILGPU scalar CPU accelerator.
+- **`Auto`** — CUDA if a GPU is present, otherwise the managed/SIMD CPU backend.
+
+All three pass the same torch-parity suite. The ILGPU *scalar* CPU accelerator (`cpu`) is a correctness-verification reference only — ~600× slower than the managed path at batch-1 — and prints a loud warning when selected. See [`docs/CPU_SIMD_BACKEND_PROGRESS.md`](docs/CPU_SIMD_BACKEND_PROGRESS.md) for the numbers.
 
 ## Installation
 
@@ -129,7 +114,7 @@ foreach (var n in order.Reversed())
 - **Matmul.** A 2D GEMM core with rank/broadcast/autograd choreography in the portable layer. Handles, PyTorch-style: 1D@1D (dot→scalar), 1D@2D, 2D@1D, 2D@2D, and N-D batched with **broadcast batch dims**; rank promotion then squeeze-back; and backward `dA = dC @ Bᵀ`, `dB = Aᵀ @ dC` **with batch-dim reduction**. Three tiers behind one interface, picked by size: **cuBLAS SGEMM** (`M,N,K ≥ 64` on CUDA — vendor-tuned, matches PyTorch FP32 at scale), a hand-tiled shared-memory kernel (the CPU large path), and the naive one-thread-per-output kernel for tiny/skinny products. Batched matmul loops cuBLAS per matrix above a work threshold (ILGPU 1.5.3 exposes no strided-batched entry point).
 - **Elementwise: struct-generic kernels, not an op-enum switch.** ILGPU kernels can't take a `Func<float,float>`. One generic kernel is parameterized by a `struct IOp { float Apply(...) }` so each op inlines at JIT (the same idiom as `ILGPU.Algorithms` reductions taking an `IScanReduceOperation`). A single arbitrary-rank strided kernel — global thread id → multi-dim index via the broadcaster's strides (stride-0 = broadcast) — covers every rank with no rank ceiling.
 - **Stay on device.** Data is a `MemoryBuffer1D<float>`. Materialize to host **only** on explicit `.ToArray()`/`.Item()`. The eager per-op model (one kernel launch per op, in-place gradient accumulation) is accepted for correctness first; cross-op fusion comes later, behind the same surface.
-- **Sync is the enemy, not launch count — and we no longer sync per launch.** Every op runs on ILGPU's in-order default stream; the stream is drained **only** at host pulls (`ToArray`/`Item`) plus a periodic safety valve (every 64 launches) to bound the in-flight queue. So hundreds of tiny kernels queue async and the device drains them in order. Two things keep the queue cheap to refill: compiled kernels are cached (never recompiled), and the small `dims`/`strides` int buffers — identical every step for a fixed-shape model — are **uploaded once and cached by content** (`_intCache`), not re-uploaded per launch. Cutting launch *count* further (fusing the compounds PyTorch fuses — `addcmul`, bias+activation) is a later step; the optimizer and reductions are already fused/parallel.
+- **Sync is the enemy, not launch count.** Every op runs on ILGPU's in-order default stream; the stream is drained **only** at host pulls (`ToArray`/`Item`) plus a periodic safety valve (every 64 launches) to bound the in-flight queue. So hundreds of tiny kernels queue async and the device drains them in order. Two things keep the queue cheap to refill: compiled kernels are cached (never recompiled), and the small `dims`/`strides` int buffers — identical every step for a fixed-shape model — are **uploaded once and cached by content** (`_intCache`), not re-uploaded per launch. Cutting launch *count* further (fusing the compounds PyTorch fuses — `addcmul`, bias+activation) is a later step; the optimizer and reductions are already fused/parallel.
 
 ### Storage & dtype
 
@@ -201,7 +186,7 @@ networks — each implemented op passing forward **and** backward torch-parity t
 uses the stride-swap transpose trick (no transpose copies); broadcast gradients reduce correctly.
 (For what's *not* implemented, see **Scope** above.)
 
-What's landed (every deterministic op forward+backward parity-tested against PyTorch; the one stochastic op, `dropout`, is property-tested — scaling, drop-rate, gradient masking — since it can't be golden-fixtured):
+The op surface — every deterministic op is forward+backward parity-tested against PyTorch; the one stochastic op, `dropout`, is property-tested (scaling, drop-rate, gradient masking) since it can't be golden-fixtured:
 
 - **Core ops** — add/sub/mul/div, unary math + activations (relu/tanh/sigmoid/gelu/exp/log/sqrt/…), broadcasting, reductions (sum/mean/var/std/min/max/argmin/argmax/prod). `Gelu` defaults to the exact-erf form (torch's default `nn.GELU()`); the tanh approximation is opt-in via `Gelu(x, approximateTanh: true)`.
 - **Linear algebra** — 2D matmul and N-D batched matmul with broadcast batch dims.
@@ -227,9 +212,9 @@ memory; autograd intermediates stay reachable until backward and are otherwise G
 per-step `DisposeGraph` recycling) removes the device-malloc churn for code that bounds its own
 lifetimes.
 
-**Landed since the early roadmap:** cuBLAS GEMM, async-stream execution (sync only at host
-pulls), the caching allocator, cached/resident stride buffers, fused Adam/SGD kernels, a chunked
-parallel reduction (so few-output/large-extent gradients like conv bias don't serialize), and
+**Runtime optimizations:** large matmuls on cuBLAS SGEMM, async-stream execution (sync only at host
+pulls), a size-bucketed caching allocator, cached/resident stride buffers, fused Adam/SGD kernels, a
+chunked parallel reduction (so few-output/large-extent gradients like conv bias don't serialize), and
 device-resident MaxPool argmax (no mid-graph host stall). An **opt-in TF32 matmul** mode
 (`TensorRuntime.AllowTf32`, off by default) trades a little matmul precision for ~1.5× on the
 tensor cores — note this is a cuBLAS *math mode*, **not** a dtype: storage stays float32, so it
@@ -238,13 +223,13 @@ doesn't violate the float32-only law. See
 [`docs/PERFORMANCE_LOG.md`](docs/PERFORMANCE_LOG.md) for the per-experiment log.
 
 Next:
-- **Trace/replay of the fixed-shape step — landed as a spike.** The dominant tiny-model cost is
-  host-side: a fresh `Tensor`/`GradNode` per op + a full C# graph rebuild every step (a PPO-scale
-  step measured **95% host-bound**, 36.7 µs/op of pure graph construction). `TensorRuntime.Capture`
-  records the step's device launches once; `CapturedGraph.Replay` re-fires them buffer-to-buffer with
-  no host graph work — a software CUDA-Graph. Measured **~2.5–2.9× faster** per step, landing replay at
-  the raw ILGPU dispatch floor. Productionizing it (buffer reclamation, step-dependent optimizer
-  scalars, conv/pool index ops, wiring into the PPO loop) is the remaining work.
+- **Productionize trace/replay of the fixed-shape step.** The dominant tiny-model cost is host-side:
+  a fresh `Tensor`/`GradNode` per op plus a full C# graph rebuild every step (a PPO-scale step is
+  ~95% host-bound, ~37 µs/op of graph construction). `TensorRuntime.Capture` records the step's
+  device launches once and `CapturedGraph.Replay` re-fires them buffer-to-buffer with no host graph
+  work — a software CUDA-Graph, **~2.5–2.9× faster** per step, at the raw ILGPU dispatch floor. It is
+  an opt-in spike today; productionizing it (buffer reclamation, step-dependent optimizer scalars,
+  conv/pool index ops, PPO-loop wiring) is the open work.
 - **CUDA Graph capture** of the static train step — the endgame for fixed-arch tiny-model training
   (would remove even the per-launch dispatch the software replay still pays), but ILGPU 1.5.3 exposes
   no graph-capture API, so it needs raw CUDA driver interop.

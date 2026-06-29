@@ -574,7 +574,7 @@ internal sealed class IlgpuRuntime : TensorRuntime
     public override void Sync() => Drain();
 
     /// <summary>Stream-ordered device→device copy (no host round-trip). Used by in-place
-    /// parameter updates and Clone, which previously bounced through host memory.</summary>
+    /// parameter updates and Clone.</summary>
     public override void DeviceCopy(TensorStorage srcS, TensorStorage dstS)
     {
         var src = B(srcS);

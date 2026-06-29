@@ -5,7 +5,7 @@ namespace Tensotron.Tests;
 /// <summary>
 /// Verifies the no-transpose-copy matmul <see cref="TensorOps.MatMulNT"/> (y = a·bᵀ) that
 /// backs <c>Linear</c>: forward and both gradients must equal the reference <c>a · bᵀ</c>
-/// computed the old way, at a small size (naive kernel) and a large size (tiled kernel).
+/// computed via an explicit transpose (MatMul(a, b.T())), at a small size (naive kernel) and a large size (tiled kernel).
 /// </summary>
 public class MatMulNtOpTests
 {

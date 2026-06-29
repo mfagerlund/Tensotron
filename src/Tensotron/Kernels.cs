@@ -82,8 +82,7 @@ internal static class Kernels
 
     /// <summary>
     /// Fused Adam / AdamW parameter update — one launch per parameter, fully in place, no
-    /// intermediate buffers or scalar uploads (replaces ~15 element-wise ops + ~8 host→device
-    /// scalar copies per parameter). Mutates m, v, p; reads g. Serves both variants:
+    /// intermediate buffers or scalar uploads. Mutates m, v, p; reads g. Serves both variants:
     ///   Adam : coupledWd = weight_decay,           decoupledFactor = 1
     ///   AdamW: coupledWd = 0,                       decoupledFactor = 1 − lr·weight_decay
     /// Bias corrections are folded into invBc1 = 1/(1−β1ᵗ), invBc2 = 1/(1−β2ᵗ) host-side.
@@ -513,7 +512,7 @@ internal static class Kernels
     /// mapped to each operand via its batch strides (stride 0 = broadcast that batch
     /// axis), so (B,M,K)@(B,K,N), (B,M,K)@(K,N), and multi-axis broadcasts all share
     /// this kernel. Matrix access uses explicit strides, so backward transposes are
-    /// stride swaps. cuBLAS strided-batched GEMM replaces this on CUDA later.
+    /// stride swaps. cuBLAS handles the compute-bound batched regime on CUDA; this kernel is the fallback.
     /// Computes c[bb,m,n] = sum_k a[aOff + m*aMs + k*aKs] * b[bOff + n*bNs + k*bKs].
     /// </summary>
     public static void MatMulBatched(
@@ -719,7 +718,7 @@ internal static class Kernels
     /// swaps (no transpose copies in backward). Output C is contiguous (M,N).
     /// Computes C[m,n] = sum_k A[m,k] * B[k,n] using:
     ///   a index = m*aMs + k*aKs ,  b index = n*bNs + k*bKs.
-    /// cuBLAS GEMM replaces this on CUDA later; same interface.
+    /// cuBLAS GEMM handles the compute-bound regime on CUDA; same interface.
     /// </summary>
     public static void MatMul2D(
         Index1D idx,

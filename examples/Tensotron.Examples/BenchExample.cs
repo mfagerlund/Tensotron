@@ -75,7 +75,7 @@ public static class BenchExample
         Thread.CurrentThread.CurrentCulture = CultureInfo.InvariantCulture;
         Console.WriteLine("== Ladder: Tensotron (ms/step, fwd+bwd+Adam; GEMM is fwd-only) ==");
 
-        // Rung 1 — MLP hot path (overhead-bound; our recent work targets exactly this).
+        // Rung 1 — MLP hot path (overhead-bound; the dominant cost for small nets).
         foreach (var (b, inD, w, d) in new[] { (256, 32, 128, 2), (1024, 128, 512, 2) })
         {
             var r = Measure(batch: b, inDim: inD, width: w, depth: d, steps: 300, warmup: 30,

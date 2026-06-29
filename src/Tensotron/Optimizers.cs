@@ -129,7 +129,7 @@ public sealed class Adam : Optimizer
             if (p.Grad == null) continue;
 
             // State (m, v) is allocated once and updated IN PLACE by the fused kernel — no
-            // per-step intermediate tensors or scalar uploads (the old path was ~15 ops/param).
+            // per-step intermediate tensors or scalar uploads.
             if (!_state.TryGetValue(p, out var s))
                 s = (Tensor.Zeros(p.Shape), Tensor.Zeros(p.Shape), 0);
             int t = s.t + 1;

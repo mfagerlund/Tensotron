@@ -160,7 +160,7 @@ public class ValidationTests
     [Fact]
     public void LeakyRelu_SlopeGreaterThanOne_MatchesTorch()
     {
-        // torch.nn.functional.leaky_relu(-1, negative_slope=2) == -2 (old Maximum form gave -1).
+        // torch.nn.functional.leaky_relu(-1, negative_slope=2) == -2: the negative branch is slope*x, not max(x, slope*x).
         var x = Tensor.FromShaped(new[] { -1f, 2f }, new[] { 2 });
         var y = TensorOps.LeakyRelu(x, slope: 2f).ToArray();
         Assert.Equal(-2f, y[0], 5);

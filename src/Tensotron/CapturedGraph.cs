@@ -10,10 +10,10 @@ namespace Tensotron;
 /// re-fires the recorded launches. Write the next minibatch into the SAME input tensors with
 /// <see cref="Tensor.Upload"/> before each replay, then read <see cref="Output"/> after.
 ///
-/// Spike scope (see <see cref="TensorRuntime.Capture"/> remarks): trace buffers are pinned for the
+/// Limitations (see <see cref="TensorRuntime.Capture"/> remarks): trace buffers are pinned for the
 /// graph's lifetime (no reclamation), step-dependent optimizer scalars (Adam bias correction,
 /// scheduled LR) are frozen at capture time, and data-dependent index ops (maxpool argmax, gather)
-/// are not yet supported.
+/// are not supported.
 /// </summary>
 public sealed class CapturedGraph
 {

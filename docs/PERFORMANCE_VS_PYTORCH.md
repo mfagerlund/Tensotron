@@ -44,8 +44,7 @@ Net: `(1,8,3,p1) → ReLU → MaxPool2 → (8,16,3,p1) → ReLU → MaxPool2 →
 \*Tensotron TF32 is **opt-in** (`TensorRuntime.AllowTf32 = true`), off by default to keep matmul
 exact-FP32. Measured on a clean/unloaded GPU. Tensotron **ties (or marginally beats) torch FP32 at
 every size** — both call cuBLAS `Sgemm` — and the TF32 knob recovers torch's TF32 speedup (~1.5–1.6×).
-(An earlier draft showed a noisy `~1 TFLOP/s` at 1024³; that was GPU contention, not real — an
-isolated GEMM is compute-bound at all three sizes.)
+(An isolated GEMM is compute-bound at all three sizes.)
 
 ## What the numbers mean
 
@@ -58,9 +57,9 @@ not where we lose.
 PyTorch's TF32 column is ~1.5x faster. **TF32 is a matmul *math mode*, not a storage dtype** —
 inputs stay FP32 in memory but are rounded to 19-bit (8-bit exponent, 10-bit mantissa) and
 multiplied on the tensor cores, accumulating back in FP32. So it does **not** conflict with the
-float32-only law (storage never changes; nothing is converted at load/save). The knob is now wired
-(`TensorRuntime.AllowTf32`, mapping to cuBLAS `CUBLAS_TF32_TENSOR_OP_MATH`); **measured**, it takes
-Tensotron from 48.7 → 76.1 TFLOP/s at 4096³, matching torch's TF32. Off by default for exact-FP32
+float32-only law (storage never changes; nothing is converted at load/save). The knob
+(`TensorRuntime.AllowTf32`, mapping to cuBLAS `CUBLAS_TF32_TENSOR_OP_MATH`) raises
+Tensotron from 48.7 to 76.1 TFLOP/s at 4096³, matching torch's TF32. Off by default for exact-FP32
 parity; flip it for a free ~1.5× on matmul-bound work. (cuBLAS's *legacy* `TensorOpMath` flag is
 faster still, ~134 TFLOP/s, but it down-converts to FP16-class precision — avoid it for training.)
 *True* 16-bit (FP16/BF16) **storage** — 2x bandwidth on top of tensor-core throughput — **is**
@@ -94,55 +93,48 @@ autotuned conv kernels (and, in the default config, runs them on tensor cores). 
 match that at FP32. We don't have to be *as fast* to be "up there" — but this is a real
 ~1.7–1.9x gap (FP32) / ~2.5x (cuDNN-TF32).
 
-## The big win that got us here
+## Conv bias-gradient reduction
 
-The CNN was **~9x slower than PyTorch** before this work. Root cause (5-whys): the MNIST
-step was 98% backward → conv backward was the whole thing → **bias gradient was 98% of conv
-backward** → it routed through `ReduceGradToShape` → the naive `ReduceSum` kernel used **one
-thread per output element**. Conv1's 8-channel bias reduction therefore ran *8 threads*,
-each serially summing 50,176 strided elements.
+Conv backward dominates the MNIST step, and the **bias gradient is ~98% of conv backward** — it
+routes through `ReduceGradToShape`. A naive `ReduceSum` kernel with **one thread per output
+element** would run Conv1's 8-channel bias reduction on just *8 threads*, each serially summing
+50,176 strided elements.
 
-Fix: a **chunked parallel reduction** — split each output's reduction across many threads
-that atomic-combine into a pre-zeroed output, sized so total threads ≈ 8192 regardless of
-output count. Conv1 bias gradient: **22.8 ms → 0.74 ms**. Full CNN step:
-**28.8 ms → ~5 ms (~6–10x).** (Atomic accumulation makes the result non-bitwise-deterministic
-— already a documented design property; the allocator-pool transparency test was relaxed
-from bit-equality to a 1e-3 tolerance, which still catches real corruption by orders of
-magnitude.)
+Instead, a **chunked parallel reduction** splits each output's reduction across many threads that
+atomic-combine into a pre-zeroed output, sized so total threads ≈ 8192 regardless of output count.
+This keeps the Conv1 bias gradient at ~0.74 ms and the full CNN step at ~5 ms. (Atomic accumulation
+makes the result non-bitwise-deterministic — a documented design property; the allocator-pool
+transparency test asserts a 1e-3 tolerance rather than bit-equality, which still catches real
+corruption by orders of magnitude.)
 
-This is *why* the honest answer to "are we up there?" flipped from "no, 9x off on conv" to
-"yes, same order of magnitude, ~2x on the worst case."
+Conv therefore stays within ~2x of PyTorch on the worst case — same order of magnitude.
 
 ## Where the next 1.5–2x lives
 
 The remaining gap on multi-op workloads is **host-side overhead, not algorithm or GPU sync**.
-The easy wins are already in (async stream, caching allocator, cached stride buffers, fused
-optimizer, parallel reductions, cuBLAS), so what's left is the per-op C# orchestration:
+The async stream, caching allocator, cached stride buffers, fused optimizer, parallel reductions,
+and cuBLAS path are in place, so the remaining lever is the per-op C# orchestration:
 
-- **Trace/replay the fixed-shape step (biggest attainable lever — landed as a spike).** A small
-  model runs the *identical* op+buffer sequence every step, yet we rebuild the autograd graph and
-  allocate a fresh `Tensor`/`GradNode` per op every time. A direct `stepbreakdown` measurement
-  pinned the cost: a PPO-scale step is **95% host-bound** (2272 µs host-dispatch vs 121 µs
-  device-tail), **36.7 µs/op of which is pure autograd-graph construction**. `TensorRuntime.Capture`
-  now records the step's device launches once and `CapturedGraph.Replay` re-fires them
-  buffer-to-buffer with no host graph work (a software CUDA-Graph). **Measured ~2.5–2.9× faster per
-  step**, landing replay at the raw ILGPU dispatch floor (~9.75 µs/launch). Confirms host overhead —
-  not math — is the small-model tax. Productionization (buffer reclamation, step-dependent optimizer
-  scalars, conv/pool ops, PPO wiring) is follow-up.
+- **Trace/replay the fixed-shape step (biggest attainable lever; available as a spike).** A small
+  model runs the *identical* op+buffer sequence every step, yet the autograd graph is rebuilt and a
+  fresh `Tensor`/`GradNode` allocated per op every time. A `stepbreakdown` measurement pins the cost:
+  a PPO-scale step is **95% host-bound** (2272 µs host-dispatch vs 121 µs device-tail), **36.7 µs/op
+  of which is pure autograd-graph construction**. `TensorRuntime.Capture` records the step's device
+  launches once and `CapturedGraph.Replay` re-fires them buffer-to-buffer with no host graph work (a
+  software CUDA-Graph), running ~2.5–2.9× faster per step at the raw ILGPU dispatch floor (~9.75
+  µs/launch) — confirming host overhead, not math, is the small-model cost. Productionization (buffer
+  reclamation, step-dependent optimizer scalars, conv/pool ops, PPO wiring) is follow-up.
 - **CUDA Graph capture (the endgame, but blocked).** Capture forward+backward+optimizer once and
   replay with a single driver call → per-launch host cost goes to ~zero. **ILGPU 1.5.3 exposes no
   graph-capture API** (verified — zero `cuGraph`/`BeginCapture` symbols in the DLL), so this needs
   raw CUDA driver interop, not a flag flip.
 - **Conv as a single large GEMM** — fold the batch into one im2col matrix instead of a per-matrix
   cuBLAS loop, to amortize launch overhead. Won't catch cuDNN; narrows the gap.
-- **TF32 matmul math mode (nearly free, not yet enabled)** — `CuBlas.MathMode = TensorOpMath`
-  routes our FP32 SGEMM through the tensor cores for ~the torch-TF32 speedup, with FP32 storage
-  unchanged. ~1.5x on matmul-bound work for one line; doesn't help host-bound small models.
 - **cuDNN conv** — out of scope; the fused/autotuned conv path an ILGPU-portable library doesn't chase.
 
 ## Verdict
 
 We match PyTorch where it's a fair fight (FP32 GEMM), beat it on small nets, and trail
 ~1.5–2.5x on conv and large MLPs — and that trailing gap is per-op host overhead plus a TF32
-matmul knob we haven't flipped (and cuDNN's conv kernels), **not** a weakness in the math. Same
+matmul knob left off by default (and cuDNN's conv kernels), **not** a weakness in the math. Same
 league. Up there.
