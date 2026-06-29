@@ -254,6 +254,39 @@ inputs (`Tensor.Upload`). Spike limits (documented, follow-up): buffers pinned f
 (no reclamation), step-dependent optimizer scalars (Adam bias correction, scheduled LR) frozen at
 capture, and data-dependent index ops (maxpool argmax, gather) not yet trace-supported.
 
+### E11 — Hand-written managed/SIMD CPU backend (`TENSOTRON_BACKEND=simd`) — *kept, decisive for CPU*
+
+**The problem:** ILGPU's `cpu` backend is its **scalar CPUAccelerator** running the *same* per-op
+device-dispatch machinery as CUDA. Measured on the policy net `8→64→64→2` (tanh, NoGrad, full
+marshal-in/read-out), batch-1 inference was **6778.9 µs** vs an identical hand-scalar C# forward at
+**8.2 µs** — **794×**. The tax is dispatch, not arithmetic (a batch-1 control net is a few µs of FLOPs).
+
+**The fix:** abstract storage behind `TensorStorage` (`DeviceStorage`=ILGPU buffer, `HostStorage`=
+`float[]`) and split `TensorRuntime` into an abstract base + `IlgpuRuntime` (unchanged) + a new
+`CpuSimdRuntime` whose `Launch*` run synchronous managed kernels (`CpuKernels`, the managed twin of
+`Kernels`). `CpuKernels` **reuses the same `IOp` structs**, so the XMath transcendentals match the GPU
+path and the full torch-fixture suite passed on the new backend with zero new test authoring (66
+op-parity + 3 showcase-smoke incl. real PPO/CNN training; gate `run-tests.ps1 -Simd`).
+
+**Results** (inference µs/fwd; SIMD = `Vector<float>` matmul):
+
+| batch | ILGPU-CPU | CpuSimd scalar | CpuSimd SIMD | hand-scalar | SIMD vs ILGPU-CPU | vs hand-scalar |
+|---|---|---|---|---|---|---|
+| 1 | 6778.9 | 12.0 | **10.5** | 8.2 | **~645×** | 1.3× |
+| 8 | 19632.6 | 46.4 | **29.4** | 31.7 | **~670×** | **0.9× (faster)** |
+| 64 | — | 370.6 | **231.9** | 255.5 | — | **0.9× (faster)** |
+
+SIMD lives in `CpuKernels.MatMul2D`: a **dot** path (`aKs==bKs==1`, forward, 4 accumulators to hide
+FMA latency) and an **AXPY** path (`bNs==1`, the transposed backward matmuls — output-stationary,
+vectorized over N). The AXPY path was the training win: without it the backward matmuls hit the scalar
+fallback (training step `8→128→128→1`/batch256: bwd 11.9 ms → **1.8 ms**, whole step **13.9 → 4.3 ms**;
+4.8 ms after dropping an `av==0` skip that diverged from torch at `0·NaN`). CPU training is ~4.5× the
+GPU at batch-256/width-128 (expected — the CPU backend targets small nets, not large-batch).
+
+**Conclusion:** the entire ILGPU-CPU cost was per-op dispatch. A managed backend erases it (~645× at
+batch-1) and SIMD on the matmul makes it beat hand-scalar C# on any math-bound batch. Full write-up:
+[`CPU_SIMD_BACKEND_PROGRESS.md`](CPU_SIMD_BACKEND_PROGRESS.md).
+
 ---
 
 ## Conclusions

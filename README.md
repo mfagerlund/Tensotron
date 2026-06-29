@@ -12,6 +12,15 @@ Tensotron is a GPU tensor and autograd library for .NET, built on **ILGPU** with
 > records a fixed-shape step once and replays it buffer-to-buffer (~2.5–2.9× on a small step; spike).
 > Still correctness-first / unoptimized: cross-op kernel fusion. See *Status* → *Next*.
 
+> **CPU backend.** There is now a hand-written, ILGPU-free managed/SIMD CPU backend
+> (`TENSOTRON_BACKEND=simd`) for small-model CPU inference/training: tensors live in `float[]` and
+> every op runs as a synchronous managed (scalar + `Vector<float>` matmul) kernel — no per-op device
+> dispatch. It passes the **same** torch-fixture parity suite (`tools/run-tests.ps1 -Simd`). It takes
+> batch-1 control-net inference from **6.8 ms** (ILGPU's *scalar* CPUAccelerator, dominated by
+> dispatch) to **~10 µs** (~645×), and at batch≥8 beats hand-written scalar C#. The ILGPU `cpu`
+> backend remains as a reference/debug device. See [`docs/CPU_SIMD_BACKEND_PLAN.md`](docs/CPU_SIMD_BACKEND_PLAN.md)
+> and [`docs/CPU_SIMD_BACKEND_PROGRESS.md`](docs/CPU_SIMD_BACKEND_PROGRESS.md).
+
 > **The law:** Tensotron mimics PyTorch in everything — naming, semantics, broadcasting, gradients. If it doesn't behave like PyTorch, it's a bug. Converting PyTorch code to Tensotron should be near-mechanical, because the names and behavior are what you'd expect.
 
 ## Quick start
@@ -89,9 +98,12 @@ foreach (var n in order.Reversed())
 
 ### ILGPU hygiene
 
-- One `Context`/`Accelerator`, owned centrally by `TensorRuntime`.
+- One `Context`/`Accelerator`, owned centrally by `IlgpuRuntime` (the ILGPU implementation of the
+  abstract `TensorRuntime`; `CpuSimdRuntime` is the managed sibling).
 - Kernels compiled once via `LoadAutoGroupedStreamKernel` and **cached in fields/dictionaries** — never recompiled per call.
 - Graceful CUDA → CPU fallback, so the suite runs without a GPU.
+- Storage is abstracted behind `TensorStorage` (`DeviceStorage` = ILGPU buffer, `HostStorage` =
+  `float[]`); the op layer is backend-agnostic and the active runtime downcasts to the storage it owns.
 
 ### The hard parts
 

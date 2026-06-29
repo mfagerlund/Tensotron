@@ -6,13 +6,14 @@ using ILGPU.Runtime.Cuda;
 namespace Tensotron;
 
 /// <summary>
-/// Which ILGPU accelerator the runtime drives. <see cref="Auto"/> prefers a CUDA GPU and falls
-/// back to the CPU accelerator; <see cref="Cuda"/> / <see cref="Cpu"/> force one.
-/// NOTE: ILGPU (through 1.5.3, its latest) has no SIMD/vectorized CPU accelerator — <see cref="Cpu"/>
-/// is ILGPU's scalar CPUAccelerator. A fast SIMD CPU path, if ever added, would be a separate
-/// hand-written backend, not an ILGPU device.
+/// Which backend the runtime drives. <see cref="Auto"/> prefers a CUDA GPU and falls back to
+/// ILGPU's CPU accelerator; <see cref="Cuda"/> / <see cref="Cpu"/> force one of the ILGPU devices.
+/// <see cref="CpuSimd"/> selects the hand-written, ILGPU-free managed/SIMD CPU backend (no per-op
+/// device dispatch) — the fast path for small-model CPU inference/training. NOTE: the ILGPU
+/// <see cref="Cpu"/> accelerator is *scalar* and carries full per-op dispatch overhead; it is kept
+/// as a correctness/debug reference, not the fast CPU path.
 /// </summary>
-public enum TensorBackend { Auto, Cuda, Cpu }
+public enum TensorBackend { Auto, Cuda, Cpu, CpuSimd }
 
 /// <summary>Structural equality/hash for int[] so shape/stride arrays can key a content cache.</summary>
 internal sealed class IntArrayComparer : IEqualityComparer<int[]>
@@ -34,20 +35,22 @@ internal sealed class IntArrayComparer : IEqualityComparer<int[]>
 }
 
 /// <summary>
-/// Owns the single ILGPU Context + Accelerator and caches compiled kernels.
-/// One accelerator, kernels loaded once and cached. The backend is chosen once, at first use,
-/// from <see cref="RequestedBackend"/> (CUDA-preferred by default so tests run anywhere).
+/// Backend-agnostic compute surface: storage allocation + the <c>Launch*</c> op kernels + a few
+/// diagnostics. Exactly one concrete runtime is live per process (chosen once from
+/// <see cref="RequestedBackend"/>): <see cref="IlgpuRuntime"/> (CUDA or ILGPU-CPU) or
+/// <see cref="CpuSimdRuntime"/> (hand-written managed/SIMD). The op layer talks only to this base
+/// type, passing <see cref="TensorStorage"/>; each runtime downcasts to the storage it owns.
 /// </summary>
-public sealed class TensorRuntime : IDisposable
+public abstract class TensorRuntime : IDisposable
 {
-    private static readonly Lazy<TensorRuntime> _instance = new(() => new TensorRuntime());
+    private static readonly Lazy<TensorRuntime> _instance = new(Create);
     public static TensorRuntime Instance => _instance.Value;
 
     /// <summary>
     /// Backend to use, read once when the runtime is first created. Set this before touching any
-    /// tensor, or set the <c>TENSOTRON_BACKEND</c> env var (auto|cuda|velocity|cpu). Tensotron
-    /// runs on exactly one accelerator process-wide, so — like PyTorch's device model — tensors
-    /// never mix backends; selecting here picks that single backend.
+    /// tensor, or set the <c>TENSOTRON_BACKEND</c> env var (auto|cuda|cpu|simd). Tensotron runs on
+    /// exactly one backend process-wide, so — like PyTorch's device model — tensors never mix
+    /// backends; selecting here picks that single backend.
     /// </summary>
     public static TensorBackend RequestedBackend { get; set; } = ParseBackendEnv();
 
@@ -55,31 +58,139 @@ public sealed class TensorRuntime : IDisposable
         (Environment.GetEnvironmentVariable("TENSOTRON_BACKEND")?.Trim().ToLowerInvariant()) switch
         {
             "cuda" or "gpu" => TensorBackend.Cuda,
+            "simd" or "cpu-simd" or "cpusimd" => TensorBackend.CpuSimd,
             "cpu" => TensorBackend.Cpu,
             _ => TensorBackend.Auto,
         };
 
-    public Context Context { get; }
+    private static TensorRuntime Create() => RequestedBackend == TensorBackend.CpuSimd
+        ? new CpuSimdRuntime()
+        : new IlgpuRuntime(RequestedBackend);
+
+    // ---- lightweight instrumentation (perf bench only; negligible when unread) ----
+    /// <summary>Kernel launches + device copies issued.</summary>
+    public long Launches { get; protected set; }
+    /// <summary>Buffer allocations (float results + int stride/dim buffers).</summary>
+    public long Allocs { get; protected set; }
+    /// <summary>Host→device uploads (scalar/leaf copies + per-launch stride buffers).</summary>
+    public long HostUploads { get; protected set; }
+    public virtual void ResetCounters() { Launches = 0; Allocs = 0; HostUploads = 0; }
+    internal void NoteHostUpload() => HostUploads++;
+
+    // ---- diagnostics (overridable; CPU-safe defaults) ----
+    public abstract string DeviceName { get; }
+    public abstract bool IsGpu { get; }
+    public abstract Context Context { get; }
+    public virtual bool UsesCuBlas => false;
+    public virtual bool AllowTf32 { get => false; set { } }
+    public virtual void SetCuBlasMathMode(int mode) { }
+    public virtual int FlushEvery { get; set; } = 64;
+    public virtual bool PoolingEnabled { get; set; } = true;
+    public virtual long PoolHits => 0;
+
+    /// <summary>Record a fixed-shape step and return a graph that replays its device launches with
+    /// no host-side graph rebuild. Only the ILGPU backend amortizes per-launch overhead this way;
+    /// the managed CPU backend has no launch to amortize and does not support it.</summary>
+    public virtual CapturedGraph Capture(Func<Tensor> body) =>
+        throw new NotSupportedException($"{GetType().Name} does not support trace capture.");
+
+    /// <summary>Re-fire a captured graph's recorded launches (no host graph rebuild).</summary>
+    internal void Replay(List<Action> thunks)
+    {
+        for (int i = 0; i < thunks.Count; i++) thunks[i]();
+    }
+
+    // ---- storage + compute surface ----
+    public abstract TensorStorage Allocate(int length);
+    internal abstract void ReturnToPool(TensorStorage buf);
+    public abstract void Sync();
+    public abstract void ZeroBuffer(TensorStorage buf);
+    public abstract void DeviceCopy(TensorStorage src, TensorStorage dst);
+
+    public abstract void LaunchBinary<TOp>(TensorStorage a, TensorStorage b, TensorStorage outv,
+        int[] outDims, int[] aStride, int[] bStride) where TOp : struct, IBinaryOp;
+    public abstract void LaunchUnaryFwd<TOp>(TensorStorage x, TensorStorage outv) where TOp : struct, IUnaryOp;
+    public abstract void LaunchUnaryBwd<TOp>(TensorStorage x, TensorStorage y, TensorStorage gy, TensorStorage gx)
+        where TOp : struct, IUnaryOp;
+    public abstract void LaunchUnaryFwdP<TOp>(TOp op, TensorStorage x, TensorStorage outv) where TOp : unmanaged, IUnaryOp;
+    public abstract void LaunchUnaryBwdP<TOp>(TOp op, TensorStorage x, TensorStorage y, TensorStorage gy, TensorStorage gx)
+        where TOp : unmanaged, IUnaryOp;
+    public abstract void LaunchAddInto(TensorStorage target, TensorStorage source);
+    public abstract void LaunchReduceSum(TensorStorage inp, TensorStorage outp,
+        int[] inDims, int[] inStrides, int[] outDims, int[] reduceMask);
+    public abstract void LaunchReduce<TR>(TensorStorage inp, TensorStorage outp,
+        int[] inDims, int[] inStrides, int[] outDims, int[] reduceMask) where TR : struct, IReduceOp;
+    public abstract void LaunchReduceArg(TensorStorage inp, TensorStorage outIdx,
+        int[] inDims, int[] inStrides, int[] outDims, int[] reduceMask, bool isMax);
+    public abstract void LaunchMatMul(TensorStorage a, TensorStorage b, TensorStorage c,
+        int M, int N, int K, int aMs, int aKs, int bKs, int bNs);
+    public abstract void LaunchReduceArgGrad(TensorStorage inp, TensorStorage gout, TensorStorage gx,
+        int[] inDims, int[] inStrides, int[] outDims, int[] reduceMask, bool isMax);
+    public abstract void LaunchProdGrad(TensorStorage inp, TensorStorage gout, TensorStorage gx,
+        int[] inDims, int[] inStrides, int[] outStrides, int[] reduceMask);
+    public abstract void LaunchStridedCopy(TensorStorage inp, TensorStorage outp,
+        int[] outDims, int[] inStrides, int baseOff = 0);
+    public abstract void LaunchScatterAxisRange(TensorStorage src, TensorStorage dst,
+        int[] srcDims, int[] dstStrides, int axis, int axisOffset);
+    public abstract void LaunchMatMulBatched(TensorStorage a, TensorStorage b, TensorStorage c,
+        int batchCount, int M, int N, int K, int aMs, int aKs, int bKs, int bNs,
+        int[] batchDims, int[] aBatchStrides, int[] bBatchStrides);
+    public abstract void LaunchGatherAxis(TensorStorage x, TensorStorage outp,
+        int[] index, int[] outDims, int[] xStrides, int axis, int mode);
+    public abstract void LaunchScatterAddAxis(TensorStorage g, TensorStorage gx,
+        int[] index, int[] srcDims, int[] dstStrides, int axis, int mode);
+    public abstract void LaunchRepeat(TensorStorage x, TensorStorage outp,
+        int[] outDims, int[] inDims, int[] inStrides);
+    public abstract void LaunchRepeatGrad(TensorStorage g, TensorStorage gx,
+        int[] outDims, int[] inDims, int[] inStrides);
+    public abstract void LaunchIm2Col(TensorStorage x, TensorStorage col, int[] cfg);
+    public abstract void LaunchCol2Im(TensorStorage gcol, TensorStorage gx, int[] cfg);
+    /// <summary>MaxPool forward; returns an opaque argmax handle (ILGPU device int buffer or a host
+    /// int[]) consumed by <see cref="LaunchMaxPool2dGrad"/>, or null when keepArgmax is false.</summary>
+    public abstract object? LaunchMaxPool2d(TensorStorage x, TensorStorage outp, int[] cfg, bool keepArgmax);
+    public abstract void LaunchMaxPool2dGrad(TensorStorage g, TensorStorage gx, object argmax);
+    public abstract void LaunchAvgPool2d(TensorStorage x, TensorStorage outp, int[] cfg);
+    public abstract void LaunchAvgPool2dGrad(TensorStorage g, TensorStorage gx, int[] cfg);
+    public abstract void LaunchAdam(TensorStorage p, TensorStorage g, TensorStorage m, TensorStorage v,
+        float b1, float oneMinusB1, float b2, float oneMinusB2,
+        float lr, float eps, float invBc1, float invBc2, float coupledWd, float decoupledFactor);
+    public abstract void LaunchSgd(TensorStorage p, TensorStorage g, TensorStorage buf,
+        float lr, float momentum, float weightDecay, float dampening, float nesterov, float hasBuf);
+
+    public abstract void Dispose();
+}
+
+/// <summary>
+/// Owns the single ILGPU Context + Accelerator and caches compiled kernels. One accelerator,
+/// kernels loaded once and cached. The backend (CUDA-preferred, else ILGPU-CPU) is chosen at
+/// construction. This is the device path; the math lives in <see cref="Kernels"/>.
+/// </summary>
+internal sealed class IlgpuRuntime : TensorRuntime
+{
+    public override Context Context { get; }
     public Accelerator Accelerator { get; }
-    public string DeviceName => Accelerator.Name;
-    public bool IsGpu => Accelerator.AcceleratorType != AcceleratorType.CPU;
+    public override string DeviceName => Accelerator.Name;
+    public override bool IsGpu => Accelerator.AcceleratorType != AcceleratorType.CPU;
+
+    // Unwrap a backend-agnostic storage handle to the ILGPU buffer it must be on this backend.
+    private static MemoryBuffer1D<float, Stride1D.Dense> B(TensorStorage s) => ((DeviceStorage)s).Buffer;
 
     // cuBLAS GEMM handle — only on the CUDA backend (null on CPU). Shares the accelerator's
     // default stream, so its launches interleave in-order with our kernels and the single Sync.
     private readonly CuBlas? _blas;
-    public bool UsesCuBlas => _blas != null;
+    public override bool UsesCuBlas => _blas != null;
 
     // TF32 tensor-core matmul is a cuBLAS *math-mode* flip — storage stays FP32, only the GEMM's
     // internal multiply rounds inputs to 19-bit TF32 on the tensor cores (FP32 accumulate). Off by
     // default so matmul stays exact-FP32 (golden-fixture parity, torch-strict equivalence). Opt-in
     // for ~1.5x on matmul-bound work. mode: 0=Default(true FP32), 1=TensorOp(legacy), 3=TF32TensorOp.
     private int _mathMode;
-    public void SetCuBlasMathMode(int mode)
+    public override void SetCuBlasMathMode(int mode)
     {
         _mathMode = mode;
         if (_blas != null) _blas.MathMode = (CuBlasMathMode)mode;
     }
-    public bool AllowTf32 { get => _mathMode == 3; set => SetCuBlasMathMode(value ? 3 : 0); }
+    public override bool AllowTf32 { get => _mathMode == 3; set => SetCuBlasMathMode(value ? 3 : 0); }
 
     // Non-generic kernels: loaded once into fields.
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>> _addInto;
@@ -131,11 +242,11 @@ public sealed class TensorRuntime : IDisposable
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
         float, float, float, float, float, float> _sgdStep;
 
-    private TensorRuntime()
+    public IlgpuRuntime(TensorBackend backend)
     {
         // Enable CPU + all GPUs (Default), then pick one device per the requested backend.
         Context = Context.Create(b => b.Default().EnableAlgorithms());
-        Accelerator = SelectDevice(Context, RequestedBackend).CreateAccelerator(Context);
+        Accelerator = SelectDevice(Context, backend).CreateAccelerator(Context);
 
         _addInto = Accelerator.LoadAutoGroupedStreamKernel<
             Index1D, ArrayView<float>, ArrayView<float>>(Kernels.AddInto);
@@ -238,16 +349,6 @@ public sealed class TensorRuntime : IDisposable
         return pick ?? ctx.GetPreferredDevice(preferCPU: false);
     }
 
-    // ---- lightweight instrumentation (perf bench only; negligible when unread) ----
-    /// <summary>Kernel launches + device copies issued (each <see cref="AfterLaunch"/>).</summary>
-    public long Launches { get; private set; }
-    /// <summary>Device buffer allocations (float results + int stride/dim buffers).</summary>
-    public long Allocs { get; private set; }
-    /// <summary>Host→device uploads (scalar/leaf CopyFromCPU + per-launch stride buffers).</summary>
-    public long HostUploads { get; private set; }
-    public void ResetCounters() { Launches = 0; Allocs = 0; HostUploads = 0; }
-    internal void NoteHostUpload() => HostUploads++;
-
     // ---- caching device allocator (size-bucketed free list) ----
     // Reuse is always on (harmless: an empty pool just falls through to a real allocation). The
     // pool is FED only by explicit Tensor.Dispose() — so default, non-disposing code is byte-for-byte
@@ -257,18 +358,18 @@ public sealed class TensorRuntime : IDisposable
     private readonly Dictionary<int, Stack<MemoryBuffer1D<float, Stride1D.Dense>>> _floatPool = new();
     private long _pooledBytes;
     private const long MaxPooledBytes = 1L << 30; // cap retained pool memory at ~1 GB
-    public bool PoolingEnabled { get; set; } = true;
+    private long _poolHits;
     /// <summary>Buffers served from the pool (no device allocation). Bench/diagnostics only.</summary>
-    public long PoolHits { get; private set; }
+    public override long PoolHits => _poolHits;
 
-    public MemoryBuffer1D<float, Stride1D.Dense> Allocate(int length)
+    public override TensorStorage Allocate(int length)
     {
         MemoryBuffer1D<float, Stride1D.Dense> buf;
         if (PoolingEnabled && _floatPool.TryGetValue(length, out var stack) && stack.Count > 0)
         {
             buf = stack.Pop();
             _pooledBytes -= (long)length * sizeof(float);
-            PoolHits++;
+            _poolHits++;
         }
         else
         {
@@ -276,12 +377,13 @@ public sealed class TensorRuntime : IDisposable
             buf = Accelerator.Allocate1D<float>(length);
         }
         if (_capture != null) (_pinned ??= new()).Add(buf);  // pin trace memory against pool reuse
-        return buf;
+        return new DeviceStorage(buf);
     }
 
     // Return an owned float buffer for reuse (called by Tensor.Dispose). Over the cap → really free.
-    internal void ReturnToPool(MemoryBuffer1D<float, Stride1D.Dense> buf)
+    internal override void ReturnToPool(TensorStorage bufS)
     {
+        var buf = B(bufS);
         if (_pinned != null && _pinned.Contains(buf)) return;  // trace owns it — never recycle/free
         long bytes = (long)buf.Length * sizeof(float);
         if (!PoolingEnabled || _pooledBytes + bytes > MaxPooledBytes) { buf.Dispose(); return; }
@@ -295,16 +397,10 @@ public sealed class TensorRuntime : IDisposable
     // Kernels launch on the accelerator's in-order default stream and are NOT synced per
     // launch. The stream is drained (a) at every host pull (Sync, via ToArray/Item) and
     // (b) every FlushEvery launches as a safety valve to bound the in-flight queue.
-    // Raise it for fixed-shape workloads (e.g. a PPO update): the recurring stride/shape int
-    // buffers are content-cached (not parked), so the only thing the safety drain frees is
-    // data-dependent index buffers (gather/scatter/pool argmax). A pure MLP has none, so the
-    // drain there only costs a Synchronize — set this large enough to span a whole update and
-    // the sole sync becomes the natural host pull at the end (the rollout's ToArray()).
     private int _flushEvery = 64;
     /// <summary>Number of kernel launches between safety-valve stream drains. Larger = fewer
-    /// auto-syncs (good for fixed-shape steps); the in-flight queue and any parked
-    /// data-dependent index buffers grow until the next drain. Minimum 1.</summary>
-    public int FlushEvery
+    /// auto-syncs (good for fixed-shape steps). Minimum 1.</summary>
+    public override int FlushEvery
     {
         get => _flushEvery;
         set => _flushEvery = Math.Max(1, value);
@@ -321,14 +417,7 @@ public sealed class TensorRuntime : IDisposable
     private int _captureExpected;     // launches seen during capture; must equal _capture.Count
     private HashSet<MemoryBuffer1D<float, Stride1D.Dense>>? _pinned;  // trace-owned; pool must not recycle
 
-    /// <summary>Record a fixed-shape step (forward+backward+optimizer) once, returning a graph that
-    /// replays it with no host-side graph rebuild. Write new inputs into the SAME input tensors
-    /// (<see cref="Tensor.Upload"/>) between replays; read <see cref="CapturedGraph.Output"/> after.
-    /// Spike limitations: buffers are pinned for the graph's lifetime (no reclamation), step-dependent
-    /// optimizer scalars (Adam bias correction, scheduled LR) are frozen at capture time, and ops with
-    /// data-dependent index buffers (maxpool argmax, gather) are not yet trace-supported (capture
-    /// throws if one is hit).</summary>
-    public CapturedGraph Capture(Func<Tensor> body)
+    public override CapturedGraph Capture(Func<Tensor> body)
     {
         if (_capture != null) throw new InvalidOperationException("Nested trace capture is not supported.");
         Sync();                                  // drain prior work so the trace starts clean
@@ -350,18 +439,10 @@ public sealed class TensorRuntime : IDisposable
         return new CapturedGraph(this, thunks, output);
     }
 
-    /// <summary>Re-fire a captured graph's recorded launches (no host graph rebuild).</summary>
-    internal void Replay(List<Action> thunks)
-    {
-        for (int i = 0; i < thunks.Count; i++) thunks[i]();
-    }
-
     // Read-only shape/stride/config int buffers recur IDENTICALLY every step (the model's
     // shapes are fixed), so they are cached by content and uploaded to the device exactly
-    // once — not re-uploaded and freed per launch. Bounded in practice by the number of
-    // distinct shapes the model touches. Data-dependent index arrays (gather/scatter idx,
-    // pool argmax) are NOT cached (their contents vary per step, which would grow the cache
-    // unbounded); those use the parked-and-freed path below.
+    // once — not re-uploaded and freed per launch. Data-dependent index arrays (gather/scatter
+    // idx, pool argmax) are NOT cached (their contents vary per step); those use the parked path.
     private readonly Dictionary<int[], MemoryBuffer1D<int, Stride1D.Dense>> _intCache =
         new(new IntArrayComparer());
     private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _pendingInts = new();
@@ -404,23 +485,23 @@ public sealed class TensorRuntime : IDisposable
 
     /// <summary>Drain the default stream and free parked stride buffers. The single sync
     /// point — host pulls (ToArray/Item) call it before reading device memory.</summary>
-    public void Sync() => Drain();
+    public override void Sync() => Drain();
 
     /// <summary>Stream-ordered device→device copy (no host round-trip). Used by in-place
     /// parameter updates and Clone, which previously bounced through host memory.</summary>
-    public void DeviceCopy(MemoryBuffer1D<float, Stride1D.Dense> src,
-                           MemoryBuffer1D<float, Stride1D.Dense> dst)
+    public override void DeviceCopy(TensorStorage srcS, TensorStorage dstS)
     {
+        var src = B(srcS);
+        var dst = B(dstS);
         src.View.CopyTo(Accelerator.DefaultStream, dst.View);
         if (_capture != null) _capture.Add(() => src.View.CopyTo(Accelerator.DefaultStream, dst.View));
         AfterLaunch();
     }
 
-    /// <summary>Stream-ordered device-side zero-fill — no host array, no host→device copy.
-    /// Tensor.Zeros uses this; it is on the autograd hot path (every backward allocates its
-    /// gradient as Zeros), where the old CopyFromCPU of a host zero array stalled per call.</summary>
-    public void ZeroBuffer(MemoryBuffer1D<float, Stride1D.Dense> buf)
+    /// <summary>Stream-ordered device-side zero-fill — no host array, no host→device copy.</summary>
+    public override void ZeroBuffer(TensorStorage bufS)
     {
+        var buf = B(bufS);
         buf.MemSetToZero(Accelerator.DefaultStream);
         if (_capture != null) _capture.Add(() => buf.MemSetToZero(Accelerator.DefaultStream));
         AfterLaunch();
@@ -438,16 +519,13 @@ public sealed class TensorRuntime : IDisposable
                     ArrayView<int>, ArrayView<int>, ArrayView<int>>(Kernels.BinaryEltwise<TOp>));
     }
 
-    // ---- launch helpers (correctness-first: temp int buffers are synced+freed per call;
-    //      TODO: cache stride buffers / use constant memory to keep launches async) ----
+    // ---- launch helpers ----
 
-    public void LaunchBinary<TOp>(
-        MemoryBuffer1D<float, Stride1D.Dense> a,
-        MemoryBuffer1D<float, Stride1D.Dense> b,
-        MemoryBuffer1D<float, Stride1D.Dense> outv,
+    public override void LaunchBinary<TOp>(
+        TensorStorage aS, TensorStorage bS, TensorStorage outvS,
         int[] outDims, int[] aStride, int[] bStride)
-        where TOp : struct, IBinaryOp
     {
+        var a = B(aS); var b = B(bS); var outv = B(outvS);
         var kernel = GetBinaryKernel<TOp>();
         var dOut = AllocInt(outDims);
         var dA = AllocInt(aStride);
@@ -457,11 +535,9 @@ public sealed class TensorRuntime : IDisposable
         AfterLaunch();
     }
 
-    public void LaunchUnaryFwd<TOp>(
-        MemoryBuffer1D<float, Stride1D.Dense> x,
-        MemoryBuffer1D<float, Stride1D.Dense> outv)
-        where TOp : struct, IUnaryOp
+    public override void LaunchUnaryFwd<TOp>(TensorStorage xS, TensorStorage outvS)
     {
+        var x = B(xS); var outv = B(outvS);
         var kernel = (Action<Index1D, ArrayView<float>, ArrayView<float>>)
             _unaryFwdKernels.GetOrAdd(typeof(TOp), _ =>
                 Accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>>(
@@ -471,13 +547,10 @@ public sealed class TensorRuntime : IDisposable
         AfterLaunch();
     }
 
-    public void LaunchUnaryBwd<TOp>(
-        MemoryBuffer1D<float, Stride1D.Dense> x,
-        MemoryBuffer1D<float, Stride1D.Dense> y,
-        MemoryBuffer1D<float, Stride1D.Dense> gy,
-        MemoryBuffer1D<float, Stride1D.Dense> gx)
-        where TOp : struct, IUnaryOp
+    public override void LaunchUnaryBwd<TOp>(
+        TensorStorage xS, TensorStorage yS, TensorStorage gyS, TensorStorage gxS)
     {
+        var x = B(xS); var y = B(yS); var gy = B(gyS); var gx = B(gxS);
         var kernel = (Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>>)
             _unaryBwdKernels.GetOrAdd(typeof(TOp), _ =>
                 Accelerator.LoadAutoGroupedStreamKernel<
@@ -488,12 +561,10 @@ public sealed class TensorRuntime : IDisposable
         AfterLaunch();
     }
 
-    public void LaunchUnaryFwdP<TOp>(
-        TOp op,
-        MemoryBuffer1D<float, Stride1D.Dense> x,
-        MemoryBuffer1D<float, Stride1D.Dense> outv)
-        where TOp : unmanaged, IUnaryOp
+    public override void LaunchUnaryFwdP<TOp>(
+        TOp op, TensorStorage xS, TensorStorage outvS)
     {
+        var x = B(xS); var outv = B(outvS);
         var kernel = (Action<Index1D, TOp, ArrayView<float>, ArrayView<float>>)
             _unaryFwdPKernels.GetOrAdd(typeof(TOp), _ =>
                 Accelerator.LoadAutoGroupedStreamKernel<Index1D, TOp, ArrayView<float>, ArrayView<float>>(
@@ -503,14 +574,10 @@ public sealed class TensorRuntime : IDisposable
         AfterLaunch();
     }
 
-    public void LaunchUnaryBwdP<TOp>(
-        TOp op,
-        MemoryBuffer1D<float, Stride1D.Dense> x,
-        MemoryBuffer1D<float, Stride1D.Dense> y,
-        MemoryBuffer1D<float, Stride1D.Dense> gy,
-        MemoryBuffer1D<float, Stride1D.Dense> gx)
-        where TOp : unmanaged, IUnaryOp
+    public override void LaunchUnaryBwdP<TOp>(
+        TOp op, TensorStorage xS, TensorStorage yS, TensorStorage gyS, TensorStorage gxS)
     {
+        var x = B(xS); var y = B(yS); var gy = B(gyS); var gx = B(gxS);
         var kernel = (Action<Index1D, TOp, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>>)
             _unaryBwdPKernels.GetOrAdd(typeof(TOp), _ =>
                 Accelerator.LoadAutoGroupedStreamKernel<
@@ -521,20 +588,19 @@ public sealed class TensorRuntime : IDisposable
         AfterLaunch();
     }
 
-    public void LaunchAddInto(
-        MemoryBuffer1D<float, Stride1D.Dense> target,
-        MemoryBuffer1D<float, Stride1D.Dense> source)
+    public override void LaunchAddInto(TensorStorage targetS, TensorStorage sourceS)
     {
+        var target = B(targetS); var source = B(sourceS);
         _addInto((int)target.Length, target.View, source.View);
         if (_capture != null) _capture.Add(() => _addInto((int)target.Length, target.View, source.View));
         AfterLaunch();
     }
 
-    public void LaunchReduceSum(
-        MemoryBuffer1D<float, Stride1D.Dense> inp,
-        MemoryBuffer1D<float, Stride1D.Dense> outp,
+    public override void LaunchReduceSum(
+        TensorStorage inpS, TensorStorage outpS,
         int[] inDims, int[] inStrides, int[] outDims, int[] reduceMask)
     {
+        var inp = B(inpS); var outp = B(outpS);
         var dInDims = AllocInt(inDims);
         var dInStrides = AllocInt(inStrides);
         var dOutDims = AllocInt(outDims);
@@ -552,7 +618,7 @@ public sealed class TensorRuntime : IDisposable
         int parts = (int)Math.Min(reducedCount, Math.Max(1, ReduceTargetThreads / Math.Max(1, outputCount)));
         if (parts > 1)
         {
-            ZeroBuffer(outp);
+            ZeroBuffer(outpS);
             _reduceSumChunked(outputCount * parts, inDims.Length, parts, inp.View, outp.View,
                 dInDims.View, dInStrides.View, dOutDims.View, dMask.View);
             if (_capture != null) _capture.Add(() => _reduceSumChunked(outputCount * parts, inDims.Length, parts,
@@ -568,12 +634,11 @@ public sealed class TensorRuntime : IDisposable
         AfterLaunch();
     }
 
-    public void LaunchReduce<TR>(
-        MemoryBuffer1D<float, Stride1D.Dense> inp,
-        MemoryBuffer1D<float, Stride1D.Dense> outp,
+    public override void LaunchReduce<TR>(
+        TensorStorage inpS, TensorStorage outpS,
         int[] inDims, int[] inStrides, int[] outDims, int[] reduceMask)
-        where TR : struct, IReduceOp
     {
+        var inp = B(inpS); var outp = B(outpS);
         var kernel = (Action<Index1D, int, ArrayView<float>, ArrayView<float>,
             ArrayView<int>, ArrayView<int>, ArrayView<int>, ArrayView<int>>)
             _reduceKernels.GetOrAdd(typeof(TR), _ =>
@@ -592,11 +657,11 @@ public sealed class TensorRuntime : IDisposable
         AfterLaunch();
     }
 
-    public void LaunchReduceArg(
-        MemoryBuffer1D<float, Stride1D.Dense> inp,
-        MemoryBuffer1D<float, Stride1D.Dense> outIdx,
+    public override void LaunchReduceArg(
+        TensorStorage inpS, TensorStorage outIdxS,
         int[] inDims, int[] inStrides, int[] outDims, int[] reduceMask, bool isMax)
     {
+        var inp = B(inpS); var outIdx = B(outIdxS);
         var dInDims = AllocInt(inDims);
         var dInStrides = AllocInt(inStrides);
         var dOutDims = AllocInt(outDims);
@@ -606,25 +671,15 @@ public sealed class TensorRuntime : IDisposable
         AfterLaunch();
     }
 
-    public void LaunchMatMul(
-        MemoryBuffer1D<float, Stride1D.Dense> a,
-        MemoryBuffer1D<float, Stride1D.Dense> b,
-        MemoryBuffer1D<float, Stride1D.Dense> c,
-        int M, int N, int K,
-        int aMs, int aKs, int bKs, int bNs)
+    public override void LaunchMatMul(
+        TensorStorage aS, TensorStorage bS, TensorStorage cS,
+        int M, int N, int K, int aMs, int aKs, int bKs, int bNs)
     {
+        var a = B(aS); var b = B(bS); var c = B(cS);
         // Compute-bound regime: cuBLAS SGEMM on CUDA (vendor-tuned), else the tiled shared-memory
-        // kernel. Small/skinny products use the naive one-thread-per-output kernel (tiling/cuBLAS
-        // launch overhead isn't worth it there).
+        // kernel. Small/skinny products use the naive one-thread-per-output kernel.
         const int TS = Kernels.MatMulTile;
         bool large = M >= 64 && N >= 64 && K >= 64;
-        // The tiled kernel launches a fixed TS×TS (=1024 for TS=32) thread group, which a GPU
-        // supports but the ILGPU CPU accelerator (≈#cores threads) does not — launching it there
-        // throws "total group size must be <= the number of available threads". Only take the tiled
-        // path when the accelerator's group cap actually fits it; otherwise (CPU, or any device with
-        // a smaller cap) fall through to the auto-grouped naive kernel — slower, but correct on every
-        // backend. On CUDA cuBLAS handles `large` first, so the tiled path is the GPU-without-cuBLAS
-        // fallback.
         bool tiledFits = TS * TS <= Accelerator.MaxNumThreadsPerGroup;
         if (large && _blas != null)
         {
@@ -665,12 +720,11 @@ public sealed class TensorRuntime : IDisposable
         _blas!.Gemm(transA, transB, N, M, K, 1f, b, ldA, a, ldB, 0f, c, N);
     }
 
-    public void LaunchReduceArgGrad(
-        MemoryBuffer1D<float, Stride1D.Dense> inp,
-        MemoryBuffer1D<float, Stride1D.Dense> gout,
-        MemoryBuffer1D<float, Stride1D.Dense> gx,
+    public override void LaunchReduceArgGrad(
+        TensorStorage inpS, TensorStorage goutS, TensorStorage gxS,
         int[] inDims, int[] inStrides, int[] outDims, int[] reduceMask, bool isMax)
     {
+        var inp = B(inpS); var gout = B(goutS); var gx = B(gxS);
         var dInDims = AllocInt(inDims);
         var dInStrides = AllocInt(inStrides);
         var dOutDims = AllocInt(outDims);
@@ -680,12 +734,11 @@ public sealed class TensorRuntime : IDisposable
         AfterLaunch();
     }
 
-    public void LaunchProdGrad(
-        MemoryBuffer1D<float, Stride1D.Dense> inp,
-        MemoryBuffer1D<float, Stride1D.Dense> gout,
-        MemoryBuffer1D<float, Stride1D.Dense> gx,
+    public override void LaunchProdGrad(
+        TensorStorage inpS, TensorStorage goutS, TensorStorage gxS,
         int[] inDims, int[] inStrides, int[] outStrides, int[] reduceMask)
     {
+        var inp = B(inpS); var gout = B(goutS); var gx = B(gxS);
         var dInDims = AllocInt(inDims);
         var dInStrides = AllocInt(inStrides);
         var dOutStrides = AllocInt(outStrides);
@@ -695,11 +748,11 @@ public sealed class TensorRuntime : IDisposable
         AfterLaunch();
     }
 
-    public void LaunchStridedCopy(
-        MemoryBuffer1D<float, Stride1D.Dense> inp,
-        MemoryBuffer1D<float, Stride1D.Dense> outp,
+    public override void LaunchStridedCopy(
+        TensorStorage inpS, TensorStorage outpS,
         int[] outDims, int[] inStrides, int baseOff = 0)
     {
+        var inp = B(inpS); var outp = B(outpS);
         var dOut = AllocInt(outDims);
         var dIn = AllocInt(inStrides);
         _stridedCopy((int)outp.Length, outDims.Length, inp.View, outp.View, dOut.View, dIn.View, baseOff);
@@ -708,11 +761,11 @@ public sealed class TensorRuntime : IDisposable
         AfterLaunch();
     }
 
-    public void LaunchScatterAxisRange(
-        MemoryBuffer1D<float, Stride1D.Dense> src,
-        MemoryBuffer1D<float, Stride1D.Dense> dst,
+    public override void LaunchScatterAxisRange(
+        TensorStorage srcS, TensorStorage dstS,
         int[] srcDims, int[] dstStrides, int axis, int axisOffset)
     {
+        var src = B(srcS); var dst = B(dstS);
         var dSrc = AllocInt(srcDims);
         var dDst = AllocInt(dstStrides);
         _scatterAxisRange((int)src.Length, srcDims.Length, src.View, dst.View,
@@ -721,26 +774,21 @@ public sealed class TensorRuntime : IDisposable
     }
 
     // Per-matrix work above which a batched product is worth one cuBLAS SGEMM per element rather
-    // than the naive one-thread-per-output kernel. Conv (im2col+matmul) rides this path: its
-    // per-matrix product is huge (M=out-channels, N=batch·spatial, K=in·kh·kw), so each element is
-    // far above this, while tiny batched matmuls (small heads etc.) stay on the naive kernel.
+    // than the naive one-thread-per-output kernel. Conv (im2col+matmul) rides this path.
     private const long CuBlasBatchedMinWork = 1L << 18;
 
-    // Target thread count for the chunked parallel reduction — enough to fill the GPU when a
-    // reduction has few outputs (so we split the reduced extent), without over-contending atomics.
+    // Target thread count for the chunked parallel reduction.
     private const int ReduceTargetThreads = 8192;
 
-    public void LaunchMatMulBatched(
-        MemoryBuffer1D<float, Stride1D.Dense> a,
-        MemoryBuffer1D<float, Stride1D.Dense> b,
-        MemoryBuffer1D<float, Stride1D.Dense> c,
+    public override void LaunchMatMulBatched(
+        TensorStorage aS, TensorStorage bS, TensorStorage cS,
         int batchCount, int M, int N, int K,
         int aMs, int aKs, int bKs, int bNs,
         int[] batchDims, int[] aBatchStrides, int[] bBatchStrides)
     {
+        var a = B(aS); var b = B(bS); var c = B(cS);
         // Compute-bound batched products: cuBLAS once per matrix. ILGPU's CuBlas (1.5.3) exposes no
-        // strided-batched entry point, so we loop plain SGEMM over the broadcast batch index —
-        // each call replaces a slow naive launch and reduces exactly to the validated 2D mapping.
+        // strided-batched entry point, so we loop plain SGEMM over the broadcast batch index.
         if (_blas != null && (long)M * N * K >= CuBlasBatchedMinWork)
         {
             int rank = batchDims.Length;
@@ -777,11 +825,11 @@ public sealed class TensorRuntime : IDisposable
     // index/gather family. The index host array is uploaded per launch (same
     // correctness-first policy as the stride buffers above).
 
-    public void LaunchGatherAxis(
-        MemoryBuffer1D<float, Stride1D.Dense> x,
-        MemoryBuffer1D<float, Stride1D.Dense> outp,
+    public override void LaunchGatherAxis(
+        TensorStorage xS, TensorStorage outpS,
         int[] index, int[] outDims, int[] xStrides, int axis, int mode)
     {
+        var x = B(xS); var outp = B(outpS);
         var dIdx = AllocInt(index, cache: false); // data-dependent
         var dOut = AllocInt(outDims);
         var dStr = AllocInt(xStrides);
@@ -790,11 +838,11 @@ public sealed class TensorRuntime : IDisposable
         AfterLaunch();
     }
 
-    public void LaunchScatterAddAxis(
-        MemoryBuffer1D<float, Stride1D.Dense> g,
-        MemoryBuffer1D<float, Stride1D.Dense> gx,
+    public override void LaunchScatterAddAxis(
+        TensorStorage gS, TensorStorage gxS,
         int[] index, int[] srcDims, int[] dstStrides, int axis, int mode)
     {
+        var g = B(gS); var gx = B(gxS);
         var dIdx = AllocInt(index, cache: false); // data-dependent
         var dSrc = AllocInt(srcDims);
         var dDst = AllocInt(dstStrides);
@@ -803,11 +851,11 @@ public sealed class TensorRuntime : IDisposable
         AfterLaunch();
     }
 
-    public void LaunchRepeat(
-        MemoryBuffer1D<float, Stride1D.Dense> x,
-        MemoryBuffer1D<float, Stride1D.Dense> outp,
+    public override void LaunchRepeat(
+        TensorStorage xS, TensorStorage outpS,
         int[] outDims, int[] inDims, int[] inStrides)
     {
+        var x = B(xS); var outp = B(outpS);
         var dOut = AllocInt(outDims);
         var dInD = AllocInt(inDims);
         var dInS = AllocInt(inStrides);
@@ -816,11 +864,11 @@ public sealed class TensorRuntime : IDisposable
         AfterLaunch();
     }
 
-    public void LaunchRepeatGrad(
-        MemoryBuffer1D<float, Stride1D.Dense> g,
-        MemoryBuffer1D<float, Stride1D.Dense> gx,
+    public override void LaunchRepeatGrad(
+        TensorStorage gS, TensorStorage gxS,
         int[] outDims, int[] inDims, int[] inStrides)
     {
+        var g = B(gS); var gx = B(gxS);
         var dOut = AllocInt(outDims);
         var dInD = AllocInt(inDims);
         var dInS = AllocInt(inStrides);
@@ -829,37 +877,29 @@ public sealed class TensorRuntime : IDisposable
         AfterLaunch();
     }
 
-    public void LaunchIm2Col(
-        MemoryBuffer1D<float, Stride1D.Dense> x,
-        MemoryBuffer1D<float, Stride1D.Dense> col,
-        int[] cfg)
+    public override void LaunchIm2Col(TensorStorage xS, TensorStorage colS, int[] cfg)
     {
+        var x = B(xS); var col = B(colS);
         var dCfg = AllocInt(cfg);
         _im2col((int)col.Length, x.View, col.View, dCfg.View);
         AfterLaunch();
     }
 
-    public void LaunchCol2Im(
-        MemoryBuffer1D<float, Stride1D.Dense> gcol,
-        MemoryBuffer1D<float, Stride1D.Dense> gx,
-        int[] cfg)
+    public override void LaunchCol2Im(TensorStorage gcolS, TensorStorage gxS, int[] cfg)
     {
+        var gcol = B(gcolS); var gx = B(gxS);
         var dCfg = AllocInt(cfg);
         _col2im((int)gcol.Length, gcol.View, gx.View, dCfg.View);
         AfterLaunch();
     }
 
     // MaxPool forward writes the per-output argmax (flat input offsets). For the training path we
-    // keep that buffer ON THE DEVICE and hand it straight to backward — no host sync, no readback,
-    // no re-upload (the old code drained the whole stream every forward just to download it, which
-    // defeats async batching and stalls hardest under GPU load). In no-grad we don't need it, so we
-    // drain once and free it — inference only, not the hot training loop. The returned buffer is
-    // captured by the backward closure and GC-reclaimed once the graph is released.
-    public MemoryBuffer1D<int, Stride1D.Dense>? LaunchMaxPool2d(
-        MemoryBuffer1D<float, Stride1D.Dense> x,
-        MemoryBuffer1D<float, Stride1D.Dense> outp,
-        int[] cfg, bool keepArgmax)
+    // keep that buffer ON THE DEVICE and hand it straight to backward — no host sync, no readback.
+    // In no-grad we don't need it, so we drain once and free it.
+    public override object? LaunchMaxPool2d(
+        TensorStorage xS, TensorStorage outpS, int[] cfg, bool keepArgmax)
     {
+        var x = B(xS); var outp = B(outpS);
         var dCfg = AllocInt(cfg);
         var dArg = Accelerator.Allocate1D<int>(outp.Length);
         _maxPool2d((int)outp.Length, x.View, outp.View, dArg.View, dCfg.View);
@@ -870,45 +910,39 @@ public sealed class TensorRuntime : IDisposable
         return null;
     }
 
-    public void LaunchMaxPool2dGrad(
-        MemoryBuffer1D<float, Stride1D.Dense> g,
-        MemoryBuffer1D<float, Stride1D.Dense> gx,
-        MemoryBuffer1D<int, Stride1D.Dense> argmax)
+    public override void LaunchMaxPool2dGrad(
+        TensorStorage gS, TensorStorage gxS, object argmax)
     {
-        _maxPool2dGrad((int)g.Length, g.View, gx.View, argmax.View);
+        var g = B(gS); var gx = B(gxS);
+        var dArg = (MemoryBuffer1D<int, Stride1D.Dense>)argmax;
+        _maxPool2dGrad((int)g.Length, g.View, gx.View, dArg.View);
         AfterLaunch();
     }
 
-    public void LaunchAvgPool2d(
-        MemoryBuffer1D<float, Stride1D.Dense> x,
-        MemoryBuffer1D<float, Stride1D.Dense> outp,
-        int[] cfg)
+    public override void LaunchAvgPool2d(TensorStorage xS, TensorStorage outpS, int[] cfg)
     {
+        var x = B(xS); var outp = B(outpS);
         var dCfg = AllocInt(cfg);
         _avgPool2d((int)outp.Length, x.View, outp.View, dCfg.View);
         AfterLaunch();
     }
 
-    public void LaunchAvgPool2dGrad(
-        MemoryBuffer1D<float, Stride1D.Dense> g,
-        MemoryBuffer1D<float, Stride1D.Dense> gx,
-        int[] cfg)
+    public override void LaunchAvgPool2dGrad(TensorStorage gS, TensorStorage gxS, int[] cfg)
     {
+        var g = B(gS); var gx = B(gxS);
         var dCfg = AllocInt(cfg);
         _avgPool2dGrad((int)g.Length, g.View, gx.View, dCfg.View);
         AfterLaunch();
     }
 
     /// <summary>Fused Adam/AdamW update (in place). See <see cref="Kernels.AdamStep"/>.</summary>
-    public void LaunchAdam(
-        MemoryBuffer1D<float, Stride1D.Dense> p,
-        MemoryBuffer1D<float, Stride1D.Dense> g,
-        MemoryBuffer1D<float, Stride1D.Dense> m,
-        MemoryBuffer1D<float, Stride1D.Dense> v,
+    public override void LaunchAdam(
+        TensorStorage pS, TensorStorage gS, TensorStorage mS, TensorStorage vS,
         float b1, float oneMinusB1, float b2, float oneMinusB2,
         float lr, float eps, float invBc1, float invBc2,
         float coupledWd, float decoupledFactor)
     {
+        var p = B(pS); var g = B(gS); var m = B(mS); var v = B(vS);
         _adamStep((int)p.Length, p.View, g.View, m.View, v.View,
             b1, oneMinusB1, b2, oneMinusB2, lr, eps, invBc1, invBc2, coupledWd, decoupledFactor);
         if (_capture != null) _capture.Add(() => _adamStep((int)p.Length, p.View, g.View, m.View, v.View,
@@ -917,18 +951,17 @@ public sealed class TensorRuntime : IDisposable
     }
 
     /// <summary>Fused SGD update (in place). See <see cref="Kernels.SgdStep"/>.</summary>
-    public void LaunchSgd(
-        MemoryBuffer1D<float, Stride1D.Dense> p,
-        MemoryBuffer1D<float, Stride1D.Dense> g,
-        MemoryBuffer1D<float, Stride1D.Dense> buf,
+    public override void LaunchSgd(
+        TensorStorage pS, TensorStorage gS, TensorStorage bufS,
         float lr, float momentum, float weightDecay, float dampening, float nesterov, float hasBuf)
     {
+        var p = B(pS); var g = B(gS); var buf = B(bufS);
         _sgdStep((int)p.Length, p.View, g.View, buf.View,
             lr, momentum, weightDecay, dampening, nesterov, hasBuf);
         AfterLaunch();
     }
 
-    public void Dispose()
+    public override void Dispose()
     {
         _blas?.Dispose();
         foreach (var stack in _floatPool.Values)

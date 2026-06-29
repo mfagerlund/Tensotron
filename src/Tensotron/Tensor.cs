@@ -1,6 +1,3 @@
-using ILGPU;
-using ILGPU.Runtime;
-
 namespace Tensotron;
 
 /// <summary>
@@ -67,7 +64,7 @@ public sealed partial class Tensor : IDisposable
     public long Id { get; } = Interlocked.Increment(ref _nextId);
 
     public Shape Shape { get; private set; }
-    internal MemoryBuffer1D<float, Stride1D.Dense> Buffer { get; private set; }
+    internal TensorStorage Buffer { get; private set; }
 
     /// <summary>
     /// True if this tensor owns its device buffer (the common case: any freshly allocated
@@ -85,7 +82,7 @@ public sealed partial class Tensor : IDisposable
 
     internal static TensorRuntime Runtime => TensorRuntime.Instance;
 
-    internal Tensor(Shape shape, MemoryBuffer1D<float, Stride1D.Dense> buffer)
+    internal Tensor(Shape shape, TensorStorage buffer)
     {
         Shape = shape;
         Buffer = buffer;
@@ -147,7 +144,7 @@ public sealed partial class Tensor : IDisposable
             throw new InvalidOperationException($"Data length {data.Length} != shape size {shape.Size} {shape}.");
         var t = Allocate(shape);
         Runtime.NoteHostUpload();
-        t.Buffer.CopyFromCPU(data);
+        t.Buffer.CopyFromHost(data);
         return t;
     }
 
@@ -167,7 +164,7 @@ public sealed partial class Tensor : IDisposable
             throw new InvalidOperationException($"Data length {data.Length} != shape size {shape.Size} {shape}.");
         var t = Allocate(shape);
         Runtime.NoteHostUpload();
-        t.Buffer.CopyFromCPU(data);
+        t.Buffer.CopyFromHost(data);
         return t;
     }
 
@@ -184,7 +181,7 @@ public sealed partial class Tensor : IDisposable
         Runtime.NoteHostUpload();
         var ones = new float[shape.Size];
         Array.Fill(ones, 1f);
-        t.Buffer.CopyFromCPU(ones);
+        t.Buffer.CopyFromHost(ones);
         return t;
     }
 
@@ -206,7 +203,7 @@ public sealed partial class Tensor : IDisposable
     public float[] ToArray()
     {
         Runtime.Sync();
-        return Buffer.GetAsArray1D();
+        return Buffer.ToHost();
     }
 
     public float Item()
@@ -241,7 +238,7 @@ public sealed partial class Tensor : IDisposable
         if (data.Length != Shape.Size)
             throw new InvalidOperationException($"CopyFromHost length {data.Length} != {Shape.Size} {Shape}.");
         Runtime.NoteHostUpload();
-        Buffer.CopyFromCPU(data);
+        Buffer.CopyFromHost(data);
     }
 
     /// <summary>Overwrite this tensor's contents from host data, in place, keeping the same device

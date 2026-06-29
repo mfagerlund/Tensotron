@@ -52,5 +52,6 @@ public static class Accelerators
 
     /// <summary>The accelerator the runtime is actually using (CUDA-preferred, CPU fallback).</summary>
     public static (AcceleratorType Type, string Name) Active() =>
-        (TensorRuntime.Instance.Accelerator.AcceleratorType, TensorRuntime.Instance.DeviceName);
+        (TensorRuntime.Instance.IsGpu ? AcceleratorType.Cuda : AcceleratorType.CPU,
+         TensorRuntime.Instance.DeviceName);
 }

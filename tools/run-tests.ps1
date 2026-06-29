@@ -18,12 +18,19 @@
   These are slow (minutes+; intended for a GPU) and are excluded from a normal run.
   By default (no -Filter, no -Showcase) the showcase convergence tests are skipped; the fast
   always-on ShowcaseSmokeTests still run.
+
+.PARAMETER Simd
+  Run the torch op-parity suite on the hand-written managed/SIMD CPU backend
+  (TENSOTRON_BACKEND=simd) instead of ILGPU. Excludes the ILGPU-only test classes (trace/replay,
+  allocator-pool, device-probe, tiled-GEMM, cuBLAS-batched) which exercise device internals the
+  managed backend doesn't have. This is the regression gate for the CPU-SIMD backend.
 #>
 param(
     [ValidateSet("Idle", "BelowNormal", "Normal")]
     [string]$Priority = "BelowNormal",
     [string]$Filter = "",
-    [switch]$Showcase
+    [switch]$Showcase,
+    [switch]$Simd
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,9 +47,16 @@ Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
+# The managed/SIMD CPU backend has no device internals, so the ILGPU-only test classes don't apply.
+$simdExclude = "FullyQualifiedName!~TraceReplay&FullyQualifiedName!~AllocatorPool&" +
+    "FullyQualifiedName!~Device&FullyQualifiedName!~TiledMatMul&FullyQualifiedName!~BatchedCuBlas&" +
+    "Category!=Showcase"
+if ($Simd) { $env:TENSOTRON_BACKEND = "simd" }
+
 $pc = [System.Diagnostics.ProcessPriorityClass]::$Priority
 $argList = "test `"$PSScriptRoot\..\Tensotron.sln`" --verbosity quiet --nologo"
 if ($Filter) { $argList += " --filter `"$Filter`"" }
+elseif ($Simd) { $argList += " --filter `"$simdExclude`"" }
 elseif ($Showcase) { $argList += " --filter `"Category=Showcase`"" }
 else { $argList += " --filter `"Category!=Showcase`"" }
 
