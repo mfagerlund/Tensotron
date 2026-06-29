@@ -380,6 +380,8 @@ public static class BenchExample
 
             Console.WriteLine($"  batch={B,-3} tensotron {tUs,8:0.00} µs/fwd | hand-scalar {hUs,7:0.00} µs/fwd | " +
                               $"{tUs / hUs,6:0.0}x  (validate maxdiff {maxDiff:0.0e+0})");
+            Console.WriteLine($"RESULT infer config=tensotron batch={B} us={tUs:0.000}");
+            Console.WriteLine($"RESULT infer config=handscalar batch={B} us={hUs:0.000}");
           }
           catch (Exception e)
           {

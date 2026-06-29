@@ -2,9 +2,42 @@
 
 A **PyTorch-faithful** tensor and autograd library for .NET, **float32** throughout. It runs on **CUDA** (via ILGPU + cuBLAS) when a GPU is present, or a hand-written **managed/SIMD CPU** backend when one isn't — same op surface, same torch-parity tests either way.
 
+<p align="center">
+<img src="docs/img/corridor.png" width="500" alt="A PPO controller trained on Tensotron drives a clean lap around a winding corridor">
+<br><sub><b>A car that taught itself to drive.</b> A continuous-PPO controller — actor, critic, GAE, clipped surrogate, all built on Tensotron — steering around a closed track from five raycast "whisker" distances alone, on a bare +1-per-step-survived reward. Trained from scratch to flawless laps in ~2 minutes <b>on the CPU backend</b>. Everything below is built the same way.</sub>
+</p>
+
 > **The law:** for every op it implements, Tensotron matches PyTorch exactly — naming, semantics, broadcasting, gradients (down to behavior at kinks, ties, and special values). If an implemented op doesn't behave like PyTorch, it's a bug. Converting PyTorch code to Tensotron is near-mechanical *within the supported surface* — which is a deliberate subset of torch, not a full reimplementation (see **Scope** below).
 
 > **Scope.** Tensotron targets feed-forward training and inference — MLPs, CNNs, and small RL policy/value nets. **Not implemented** (yet): recurrent layers (RNN/LSTM/GRU), attention / transformer blocks, `Embedding`, `ConvTranspose`, `Conv1d`/`Conv3d`, a dtype system beyond float32, and PyTorch `state_dict`/`safetensors` interop. If your model is sequence- or transformer-shaped, this isn't (yet) the library for it.
+
+## See it learn
+
+Two from-scratch training loops in `examples/` — each a few dozen lines of plain Tensotron — produce these:
+
+<p align="center">
+<img src="docs/img/spiral.png" width="420" alt="Learned three-class spiral decision boundary">
+<br><sub><b>Spiral</b> — an MLP separates three interleaved spiral arms. Shaded cells are the learned decision regions; dots are the data, colored by true class.</sub>
+</p>
+
+<p align="center">
+<img src="docs/img/regression.png" width="560" alt="MLP fitting a noisy sine">
+<br><sub><b>Regression</b> — the same kind of stack fits a noisy sine. Blue is the network output; red dots are the samples.</sub>
+</p>
+
+For the reinforcement-learning demo — a PPO controller driving the corridor above — see [`showcase/`](showcase/Tensotron.Showcase) (`CorridorTests`): +1 per surviving step, five whisker sensors, and the track geometry forbids farming reward by circling in place, so it has to actually drive.
+
+## Performance vs PyTorch
+
+**A single-agent control-net forward — the game-AI / RL-inference case — runs ~8× faster on Tensotron's CPU backend than on PyTorch CPU.** A tiny net's cost is per-op dispatch overhead, and Tensotron's managed/SIMD backend has almost none of PyTorch's. PyTorch's tuned GEMM pulls ahead only once the batch is large enough for arithmetic to dominate (~batch 64, shown below — not hidden), and on the GPU a batch-1 forward is *slower* than CPU on **both** libraries: launch overhead, not math. For inference of one agent at a time, the CPU backend is the right tool.
+
+![CPU inference latency: Tensotron SIMD vs PyTorch CPU](docs/img/cpu_inference.png)
+
+At training scale and on the GPU, Tensotron is in PyTorch's league — it ties or marginally beats PyTorch on FP32 GEMM (both call cuBLAS `Sgemm`), wins on small MLPs, and trails ~1.5–2× on conv and large MLPs (per-op host overhead plus cuDNN's fused conv kernels).
+
+![GPU training step and FP32 GEMM throughput vs PyTorch](docs/img/gpu_training.png)
+
+Methodology, full tables, and the *why* are in [`docs/PERFORMANCE_VS_PYTORCH.md`](docs/PERFORMANCE_VS_PYTORCH.md). Reproduce the CPU figure with `dotnet run --project examples/Tensotron.Examples -c Release -- inference` (under `TENSOTRON_BACKEND=simd` then `=cuda`) plus `python tools/bench/torch_infer.py`; the GPU figure with `... -- ladder` plus `python tools/bench/torch_bench.py` on an unloaded GPU.
 
 ## Backends
 
@@ -200,7 +233,7 @@ The op surface — every deterministic op is forward+backward parity-tested agai
 Layout:
 - `src/Tensotron/` — `Shape`, `Tensor` (autograd), `TensorOps.*` (op surface), `Kernels`, `TensorRuntime`, `Ops` (struct-generic op types), plus `Module`/`Conv`/`Pool`/`Norm`/`Optimizers`/`LrSchedulers`/`Init`/`DataLoader`/`Serialization`.
 - `tests/Tensotron.Tests/` — torch-parity tests + `Fixtures` loader; `Fixtures/*.json` committed. **"Tensotron works."**
-- `showcase/Tensotron.Showcase/` — end-to-end usability tasks (continuous-PPO pole-cart control, MNIST CNN) that assert real learning and emit SVG replays. **"Tensotron can be used for these things."**
+- `showcase/Tensotron.Showcase/` — end-to-end usability tasks (continuous-PPO pole-cart and corridor-following control, MNIST CNN) that assert real learning and emit SVG replays. **"Tensotron can be used for these things."**
 - `tools/fixtures/gen.py` — torch fixture generator (self-embeds its source into each JSON).
 
 **Buffer lifetime.** `Tensor` is `IDisposable`. Each tensor owns its device buffer except
