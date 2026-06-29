@@ -86,6 +86,51 @@ accelerator** because `Auto` fell back to it. Fixed:
 - Verified the 4-way matrix on the 4090 box: default→CUDA; `CUDA_VISIBLE_DEVICES=-1`→**CPU-SIMD**;
   `cpu`→`CPUAccelerator`+banner; `simd`→CPU-SIMD silent. Gates green (default 78+3, `-Simd` 66+3).
 
+### Multi-threaded matmul — opt-in row parallelism (2026-06-29)
+Prompted by Walker's PPO bench (CPU flat ~1.5 s, compute-bound), added **within-op row parallelism**
+to `CpuKernels.MatMul2D`. All three paths (dot / AXPY / scalar) share the `for m` outer loop and each
+row writes a disjoint `c[m*N..]` slice, so splitting rows across workers is **bit-identical to serial**
+(verified: `-Simd` suite green at `TENSOTRON_CPU_THREADS=max`, incl. the matmul-heavy PPO/CNN showcase).
+Knobs: `CpuKernels.MatMulThreads` (worker cap, 1 = serial) + `MatMulParallelMinFlops` (default 1e6 FLOP
+floor). Set via `TENSOTRON_CPU_THREADS` (`auto`/`max`/N/`off`) and the public
+`TensorRuntime.CpuMatMulThreads` property; `TENSOTRON_CPU_MINFLOPS` overrides the floor.
+
+**It is NOT an unconditional win** (so it defaults OFF). Three regimes, measured on a **16-core /
+32-thread (SMT)** box. Note: `auto` resolves to **physical cores (16 here)**, not
+`Environment.ProcessorCount` (32) — SMT siblings share the vector units, so the speedup plateaus at
+physical-core count (`t16 ≈ t32` below, and `t32` is the *worst* option under load). `max` still uses
+all 32 logical if you want it.
+
+- **Too small → threading overhead loses.** 64³ (0.5 MFLOP) *regresses ~18%* parallel; batch-1 (M=1)
+  is auto-serial via the `M>=2` guard. The 1e6-FLOP gate keeps all tiny/latency-bound matmuls serial.
+- **Single trainer, idle cores → big win.** Speedup vs serial, best thread count:
+
+  | GEMM | FLOP | serial | best | speedup |
+  |---|---|---|---|---|
+  | strider L2 mb256 | 2.1M | 0.19 ms | 32t | 2.4× |
+  | strider L2 mb8192 | 67M | 7.9 ms | 32t | 6.4× |
+  | 8192×256×256 | 1.1G | 81.7 ms | 32t | 10.0× |
+  | 2048×2048×256 | 2.1G | 227 ms | 32t | 12.1× |
+
+  (Plateaus ~8–12× at physical-core count — memory bandwidth + all-core clock throttle, and SMT
+  siblings add nothing: `t16 ≈ t32`, which is why `auto` = 16 here, not 32.)
+- **Loaded cores → threading backfires.** With N spinner threads occupying cores during the matmul:
+
+  | busy cores | 67M GEMM best | 1.1G GEMM best |
+  |---|---|---|
+  | 0 | 32t, 4.9× | 32t, 7.0× |
+  | 8 | 32t, 3.1× | 32t, 7.3× |
+  | 16 | 32t, 2.7× | 32t, 6.1× |
+  | 31 | **1t (serial wins)** | 8t, 2.7× (t32 worst) |
+
+  At saturation the 67M GEMM is *fastest serial* and oversubscribing to 32t is the worst option.
+
+**Verdict / how to use.** No safe always-on default — it hinges on deployment, which only the caller
+knows. **One big-batch trainer on an idle box → `TENSOTRON_CPU_THREADS=auto` for 5–12×** on the
+matmul-bound steps. **Many parallel agents (cores saturated, typical multi-env PPO) → leave it OFF**
+(=1) so each agent owns a core; per-agent threading just oversubscribes. The FLOP gate makes "on"
+safe for small matmuls regardless. Default is serial; the knob is the lever.
+
 ## Conclusions
 
 **The thesis held, decisively.** ILGPU's "CPU" cost was per-op device dispatch, not arithmetic; a

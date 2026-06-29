@@ -112,6 +112,12 @@ public sealed class BatchNorm1d : Module
         yield return ("weight", Weight);
         yield return ("bias", Bias);
     }
+
+    protected override IEnumerable<(string, Tensor)> OwnBuffers()
+    {
+        yield return ("running_mean", RunningMean);
+        yield return ("running_var", RunningVar);
+    }
 }
 
 /// <summary>Group normalization layer (torch.nn.GroupNorm) with per-channel affine.</summary>
@@ -220,5 +226,11 @@ public sealed class BatchNorm2d : Module
     {
         yield return ("weight", Weight);
         yield return ("bias", Bias);
+    }
+
+    protected override IEnumerable<(string, Tensor)> OwnBuffers()
+    {
+        yield return ("running_mean", RunningMean);
+        yield return ("running_var", RunningVar);
     }
 }

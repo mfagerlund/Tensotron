@@ -144,6 +144,15 @@ public abstract class TensorRuntime : IDisposable
     public virtual bool PoolingEnabled { get; set; } = true;
     public virtual long PoolHits => 0;
 
+    /// <summary>
+    /// Max worker threads for the managed CPU backend's row-parallel matmul (the only multi-threaded
+    /// op). 1 = serial. Only the SIMD CPU backend honors it; GPU/ILGPU ignore it. Set it lower (or 1)
+    /// when you run many Tensotron instances in parallel (e.g. PPO agents per core) so they don't
+    /// oversubscribe; raise it for a single big-batch trainer. Defaults from <c>TENSOTRON_CPU_THREADS</c>
+    /// (<c>auto</c> = physical cores, <c>max</c> = all logical, N, or off=1).
+    /// </summary>
+    public virtual int CpuMatMulThreads { get; set; } = 1;
+
     /// <summary>Record a fixed-shape step and return a graph that replays its device launches with
     /// no host-side graph rebuild. Only the ILGPU backend amortizes per-launch overhead this way;
     /// the managed CPU backend has no launch to amortize and does not support it.</summary>

@@ -57,7 +57,11 @@ public static partial class TensorOps
     public static Tensor Tanh(Tensor x) => Unary<TanhOp>("Tanh", x);
     public static Tensor Sigmoid(Tensor x) => Unary<SigmoidOp>("Sigmoid", x);
     public static Tensor Relu(Tensor x) => Unary<ReluOp>("Relu", x);
-    public static Tensor Gelu(Tensor x) => Unary<GeluOp>("Gelu", x);
+    /// <summary>GELU. Defaults to the exact (erf) form like torch's <c>nn.GELU()</c> /
+    /// <c>F.gelu(approximate='none')</c>; pass <paramref name="approximateTanh"/> = true for the
+    /// tanh approximation (<c>F.gelu(approximate='tanh')</c>).</summary>
+    public static Tensor Gelu(Tensor x, bool approximateTanh = false)
+        => approximateTanh ? Unary<GeluOp>("GeluTanh", x) : Unary<GeluErfOp>("Gelu", x);
     public static Tensor Softplus(Tensor x) => Unary<SoftplusOp>("Softplus", x);
 }
 

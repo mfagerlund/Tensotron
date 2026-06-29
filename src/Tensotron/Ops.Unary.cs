@@ -135,6 +135,37 @@ public readonly struct ClampOp : IUnaryOp
     public float Backward(float x, float y, float gy) => (x >= _min && x <= _max) ? gy : 0f;
 }
 
+/// <summary>
+/// GELU, exact (erf) form — matches torch's DEFAULT <c>nn.GELU()</c> / <c>F.gelu(approximate='none')</c>.
+/// This is what <see cref="TensorOps.Gelu"/> uses by default; the tanh approximation
+/// (<see cref="GeluOp"/>) is opt-in via <c>approximateTanh: true</c>.
+/// </summary>
+public readonly struct GeluErfOp : IUnaryOp
+{
+    private const float InvSqrt2 = 0.7071067811865476f;    // 1/sqrt(2)
+    private const float InvSqrt2Pi = 0.3989422804014327f;  // 1/sqrt(2*pi)
+
+    public float Forward(float x) => 0.5f * x * (1f + Erf(x * InvSqrt2));
+
+    public float Backward(float x, float y, float gy)
+    {
+        float cdf = 0.5f * (1f + Erf(x * InvSqrt2));
+        float pdf = InvSqrt2Pi * XMath.Exp(-0.5f * x * x);   // exact N(0,1) density
+        return gy * (cdf + x * pdf);
+    }
+
+    // erf via Abramowitz & Stegun 7.1.26: |abs err| <= 1.5e-7 — comfortably inside the 2e-4 parity
+    // gate, and identical on the GPU and managed-CPU paths (both execute this same struct).
+    private static float Erf(float x)
+    {
+        float s = x < 0f ? -1f : 1f;
+        float ax = x < 0f ? -x : x;
+        float t = 1f / (1f + 0.3275911f * ax);
+        float poly = t * (0.254829592f + t * (-0.284496736f + t * (1.421413741f + t * (-1.453152027f + t * 1.061405429f))));
+        return s * (1f - poly * XMath.Exp(-ax * ax));
+    }
+}
+
 /// <summary>GELU, tanh approximation (matches torch gelu(approximate='tanh')).</summary>
 public readonly struct GeluOp : IUnaryOp
 {

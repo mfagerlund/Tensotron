@@ -155,6 +155,20 @@ def gen_unary():
     return cases
 
 
+def gen_gelu():
+    """Exact (erf) GELU — torch's DEFAULT F.gelu(approximate='none') / nn.GELU(), which is what
+    Tensotron's Gelu() uses by default. The tanh approximation is covered by the 'gelu' case in
+    unary.json (Tensotron's Gelu(approximateTanh: true)). Self-seeded so it regenerates identically
+    whether run alone or from the full pipeline."""
+    import torch.nn.functional as TF
+    torch.manual_seed(0)
+    cases = [run_unary("gelu", lambda x: TF.gelu(x), "real")]
+    # Boundary: include exactly 0 (gelu(0)=0, grad(0)=0.5) and a spread around it.
+    edge = [-3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0]
+    cases.append(run_unary_explicit("gelu", "gelu(erf) @ incl 0", edge, [1, 7], lambda x: TF.gelu(x)))
+    return cases
+
+
 def _dom(shape, dom):
     base = torch.randn(*shape)
     if dom == "pos":
@@ -940,6 +954,7 @@ if __name__ == "__main__":
     emit("sum", gen_sum)
     emit("matmul", gen_matmul)
     emit("unary", gen_unary)
+    emit("gelu", gen_gelu)
     emit("binary", gen_binary)
     emit("composite", gen_composite)
     emit("reduce", gen_reduce)

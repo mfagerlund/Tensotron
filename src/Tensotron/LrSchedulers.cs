@@ -40,6 +40,24 @@ public abstract class LrScheduler
         Optimizer.LearningRate = Compute(LastEpoch);
     }
 
+    /// <summary>Scheduler state for checkpointing: the epoch counter + the lazy-init flag. The
+    /// closed-form rate is re-derived from the constructor args (tMax, etaMin, …), so restoring the
+    /// epoch fully restores the LR position. Stored as 1-element tensors to share the serializer.</summary>
+    public IEnumerable<(string name, Tensor tensor)> StateDict()
+    {
+        yield return ("last_epoch", Tensor.FromArray(new[] { (float)LastEpoch }, 1));
+        yield return ("initialized", Tensor.FromArray(new[] { _initialized ? 1f : 0f }, 1));
+    }
+
+    /// <summary>Restore state from <see cref="StateDict"/> and re-apply the LR for that epoch, so a
+    /// resumed run continues the same schedule instead of restarting it.</summary>
+    public void LoadStateDict(IReadOnlyDictionary<string, Tensor> state)
+    {
+        if (state.TryGetValue("last_epoch", out var le)) LastEpoch = (int)MathF.Round(le.Item());
+        _initialized = state.TryGetValue("initialized", out var ini) && ini.Item() != 0f;
+        if (_initialized) Optimizer.LearningRate = Compute(LastEpoch);
+    }
+
     protected abstract float Compute(int epoch);
 }
 

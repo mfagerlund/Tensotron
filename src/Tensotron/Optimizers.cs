@@ -26,6 +26,21 @@ public abstract class Optimizer
 
     public abstract void Step();
 
+    /// <summary>
+    /// Per-parameter optimizer state (momentum/Adam moments + step counts) as named tensors, keyed
+    /// by the parameter's index in <see cref="Parameters"/> (e.g. <c>"3.m"</c>, <c>"3.step"</c>).
+    /// Step counts are stored as 1-element tensors so the whole state rides the same tensor
+    /// serializer. Empty for stateless optimizers / params not yet stepped.
+    /// </summary>
+    public virtual IEnumerable<(string name, Tensor tensor)> StateDict() => Array.Empty<(string, Tensor)>();
+
+    /// <summary>Restore state produced by <see cref="StateDict"/> (same parameter ordering). Resumes
+    /// training exactly — without it, a reloaded optimizer restarts its moments and diverges.</summary>
+    public virtual void LoadStateDict(IReadOnlyDictionary<string, Tensor> state) { }
+
+    /// <summary>Wrap an int (e.g. a step count) as a 1-element tensor for serialization.</summary>
+    protected static Tensor Scalar1(float v) => Tensor.FromArray(new[] { v }, 1);
+
     // Run an update closure with autograd disabled and write the result back in place.
     protected static void Update(Tensor param, Tensor newValue)
     {
@@ -78,6 +93,20 @@ public sealed class Sgd : Optimizer
                 LearningRate, _momentum, _weightDecay, _dampening, _nesterov ? 1f : 0f, hasBuf);
         }
     });
+
+    public override IEnumerable<(string, Tensor)> StateDict()
+    {
+        for (int i = 0; i < Parameters.Count; i++)
+            if (_buf.TryGetValue(Parameters[i], out var buf))
+                yield return ($"{i}.momentum_buffer", buf);
+    }
+
+    public override void LoadStateDict(IReadOnlyDictionary<string, Tensor> state)
+    {
+        for (int i = 0; i < Parameters.Count; i++)
+            if (state.TryGetValue($"{i}.momentum_buffer", out var buf))
+                _buf[Parameters[i]] = buf;
+    }
 }
 
 /// <summary>Adam (torch.optim.Adam). weight_decay is the coupled L2 variant.</summary>
@@ -114,6 +143,33 @@ public sealed class Adam : Optimizer
                 coupledWd: _weightDecay, decoupledFactor: 1f);
         }
     });
+
+    public override IEnumerable<(string, Tensor)> StateDict() => AdamState(_state, Parameters);
+    public override void LoadStateDict(IReadOnlyDictionary<string, Tensor> state) => LoadAdamState(_state, Parameters, state);
+
+    // Shared (m, v, step) serialization for Adam/AdamW.
+    internal static IEnumerable<(string, Tensor)> AdamState(
+        Dictionary<Tensor, (Tensor m, Tensor v, int t)> st, IReadOnlyList<Tensor> ps)
+    {
+        for (int i = 0; i < ps.Count; i++)
+            if (st.TryGetValue(ps[i], out var s))
+            {
+                yield return ($"{i}.m", s.m);
+                yield return ($"{i}.v", s.v);
+                yield return ($"{i}.step", Scalar1(s.t));
+            }
+    }
+
+    internal static void LoadAdamState(
+        Dictionary<Tensor, (Tensor m, Tensor v, int t)> st, IReadOnlyList<Tensor> ps,
+        IReadOnlyDictionary<string, Tensor> state)
+    {
+        for (int i = 0; i < ps.Count; i++)
+            if (state.TryGetValue($"{i}.m", out var m) &&
+                state.TryGetValue($"{i}.v", out var v) &&
+                state.TryGetValue($"{i}.step", out var step))
+                st[ps[i]] = (m, v, (int)MathF.Round(step.Item()));
+    }
 }
 
 /// <summary>AdamW (torch.optim.AdamW): decoupled weight decay applied directly to the params.</summary>
@@ -150,6 +206,9 @@ public sealed class AdamW : Optimizer
                 coupledWd: 0f, decoupledFactor: decoupled);
         }
     });
+
+    public override IEnumerable<(string, Tensor)> StateDict() => Adam.AdamState(_state, Parameters);
+    public override void LoadStateDict(IReadOnlyDictionary<string, Tensor> state) => Adam.LoadAdamState(_state, Parameters, state);
 }
 
 /// <summary>RMSprop (torch.optim.RMSprop) with optional momentum and centering.</summary>
@@ -204,6 +263,27 @@ public sealed class RmsProp : Optimizer
             _state[p] = (v, avg, buf);
         }
     });
+
+    public override IEnumerable<(string, Tensor)> StateDict()
+    {
+        for (int i = 0; i < Parameters.Count; i++)
+            if (_state.TryGetValue(Parameters[i], out var s))
+            {
+                yield return ($"{i}.square_avg", s.v);
+                if (s.avg is not null) yield return ($"{i}.grad_avg", s.avg);
+                if (s.buf is not null) yield return ($"{i}.momentum_buffer", s.buf);
+            }
+    }
+
+    public override void LoadStateDict(IReadOnlyDictionary<string, Tensor> state)
+    {
+        for (int i = 0; i < Parameters.Count; i++)
+            if (state.TryGetValue($"{i}.square_avg", out var v))
+                _state[Parameters[i]] = (
+                    v,
+                    state.TryGetValue($"{i}.grad_avg", out var avg) ? avg : null,
+                    state.TryGetValue($"{i}.momentum_buffer", out var buf) ? buf : null);
+    }
 }
 
 /// <summary>Gradient utilities (torch.nn.utils).</summary>

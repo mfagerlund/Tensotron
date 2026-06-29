@@ -17,14 +17,30 @@ Tensotron is a GPU tensor and autograd library for .NET, built on **ILGPU** with
 > every op runs as a synchronous managed (scalar + `Vector<float>` matmul) kernel — no per-op device
 > dispatch. It passes the **same** torch-fixture parity suite (`tools/run-tests.ps1 -Simd`). It takes
 > batch-1 control-net inference from **6.8 ms** (ILGPU's *scalar* CPUAccelerator, dominated by
-> dispatch) to **~10 µs** (~645×), and at batch≥8 beats hand-written scalar C#.
+> dispatch) to **~10 µs** (~645×), and at batch≥8 beats hand-written scalar C#. Its matmul has
+> **opt-in row parallelism** (`TENSOTRON_CPU_THREADS=auto`) — ~5–12× on big-batch GEMMs for a single
+> trainer on idle cores, off by default because it oversubscribes when many agents already saturate
+> the cores (see the progress doc for the measured curve).
 > **`Auto` (the default) now falls back to this SIMD backend when no CUDA GPU is present** — not to
 > the slow ILGPU CPU accelerator. That ILGPU `cpu` accelerator is kept *only* as a
 > correctness/verification reference (`TENSOTRON_BACKEND=cpu`); selecting it prints a loud warning,
 > because it is ~600× slower than the managed path at batch-1. See [`docs/CPU_SIMD_BACKEND_PLAN.md`](docs/CPU_SIMD_BACKEND_PLAN.md)
 > and [`docs/CPU_SIMD_BACKEND_PROGRESS.md`](docs/CPU_SIMD_BACKEND_PROGRESS.md).
 
-> **The law:** Tensotron mimics PyTorch in everything — naming, semantics, broadcasting, gradients. If it doesn't behave like PyTorch, it's a bug. Converting PyTorch code to Tensotron should be near-mechanical, because the names and behavior are what you'd expect.
+> **The law:** for every op it implements, Tensotron matches PyTorch exactly — naming, semantics, broadcasting, gradients (down to behavior at kinks, ties, and special values). If an implemented op doesn't behave like PyTorch, it's a bug. Converting PyTorch code to Tensotron is near-mechanical *within the supported surface* — which is a deliberate subset of torch, not a full reimplementation (see **Scope** below).
+
+> **Scope.** Tensotron targets feed-forward training and inference — MLPs, CNNs, and small RL policy/value nets. **Not implemented** (yet): recurrent layers (RNN/LSTM/GRU), attention / transformer blocks, `Embedding`, `ConvTranspose`, `Conv1d`/`Conv3d`, a dtype system beyond float32, and PyTorch `state_dict`/`safetensors` interop. If your model is sequence- or transformer-shaped, this isn't (yet) the library for it.
+
+## Installation
+
+Tensotron is **not yet published to NuGet.** Consume it from source:
+
+- **Project reference** (recommended): clone the repo and reference the library project —
+  `<ProjectReference Include="path/to/Tensotron/src/Tensotron/Tensotron.csproj" />`.
+- **Local package**: `dotnet pack src/Tensotron/Tensotron.csproj -c Release` produces
+  `Tensotron.0.1.0-alpha.nupkg`, which you can add to a local NuGet feed.
+
+Requires .NET 8. A GPU is optional — without CUDA it runs on the managed CPU backend.
 
 ## Quick start
 
@@ -178,21 +194,22 @@ for that verification reference.
 
 ## Status
 
-**A full training stack, every op torch-verified.** The tensor/backend split, the
-cached-kernel runtime (`TensorRuntime`), and toposort + `GradNode` autograd are in place,
-and the op surface is broad enough to build and train real networks — each op passing
-forward **and** backward torch-parity tests. Matmul backward uses the stride-swap transpose
-trick (no transpose copies); broadcast gradients reduce correctly.
+**A complete training stack for its scope; every *implemented* op torch-verified.** The
+tensor/backend split, the cached-kernel runtime (`TensorRuntime`), and toposort + `GradNode`
+autograd are in place, and the op surface is broad enough to build and train real feed-forward
+networks — each implemented op passing forward **and** backward torch-parity tests. Matmul backward
+uses the stride-swap transpose trick (no transpose copies); broadcast gradients reduce correctly.
+(For what's *not* implemented, see **Scope** above.)
 
-What's landed (all parity-tested against PyTorch):
+What's landed (every listed op parity-tested against PyTorch):
 
-- **Core ops** — add/sub/mul/div, unary math + activations (relu/tanh/sigmoid/gelu/exp/log/sqrt/…), broadcasting, reductions (sum/mean/var/std/min/max/argmin/argmax/prod).
+- **Core ops** — add/sub/mul/div, unary math + activations (relu/tanh/sigmoid/gelu/exp/log/sqrt/…), broadcasting, reductions (sum/mean/var/std/min/max/argmin/argmax/prod). `Gelu` defaults to the exact-erf form (torch's default `nn.GELU()`); the tanh approximation is opt-in via `Gelu(x, approximateTanh: true)`.
 - **Linear algebra** — 2D matmul and N-D batched matmul with broadcast batch dims.
 - **Movement / structure** — reshape/view, squeeze/unsqueeze, flatten, expand, permute/transpose, narrow, cat/stack, chunk/split.
 - **Indexing** — index_select, gather, scatter_add, repeat.
 - **NN** — `Module`/`Sequential`/`Linear`, dropout, **Conv2d** (im2col + batched matmul), **MaxPool2d / AvgPool2d**, normalization (LayerNorm, BatchNorm1d/2d, GroupNorm).
 - **Losses** — MSE, L1, Huber, BCE-with-logits, NLL, cross-entropy, KL-div.
-- **Training** — SGD/Adam/AdamW/RMSProp, grad-norm clipping, LR schedulers (Step/Exponential/Cosine/Linear), Kaiming/Xavier init, `DataLoader`, binary serialization (save/load).
+- **Training** — SGD/Adam/AdamW/RMSProp, grad-norm clipping, LR schedulers (Step/Exponential/Cosine/Linear), Kaiming/Xavier init, `DataLoader`. Serialization saves the full module state_dict (parameters **and** buffers — e.g. BatchNorm running stats), and `Serialization.SaveCheckpoint`/`LoadCheckpoint` round-trips a complete resumable training checkpoint (model + optimizer moments/step + LR-scheduler epoch).
 - **Device** — torch.cuda-flavored availability probe: `Cuda.IsAvailable()` / `DeviceCount()` / `GetDeviceName()`, plus `Accelerators.List()` / `Active()` diagnostics. One global accelerator (CUDA-preferred, CPU fallback); there is intentionally no per-tensor device or `tensor.to(device)`.
 
 Layout:

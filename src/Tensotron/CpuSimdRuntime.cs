@@ -16,6 +16,34 @@ internal sealed class CpuSimdRuntime : TensorRuntime
     public override string DeviceName => "CPU-SIMD";
     public override bool IsGpu => false;
 
+    public CpuSimdRuntime()
+    {
+        // TENSOTRON_CPU_THREADS: worker cap for row-parallel matmul. "auto" = physical cores (SMT
+        // siblings barely help GEMM), "max" = all logical CPUs, an int = that many, "off"/unset/1 =
+        // serial. Stays serial for small GEMMs regardless (CpuKernels.MatMulParallelMinFlops gate).
+        CpuMatMulThreads = ParseThreadsEnv(Environment.GetEnvironmentVariable("TENSOTRON_CPU_THREADS"));
+        // Advanced tuning: FLOP floor (2*M*N*K) below which matmul stays serial. Rarely set by hand.
+        var mf = Environment.GetEnvironmentVariable("TENSOTRON_CPU_MINFLOPS");
+        if (long.TryParse(mf, out var minFlops) && minFlops >= 0)
+            CpuKernels.MatMulParallelMinFlops = minFlops;
+    }
+
+    private static int ParseThreadsEnv(string? v)
+    {
+        v = v?.Trim().ToLowerInvariant();
+        if (string.IsNullOrEmpty(v) || v == "off" || v == "1") return 1;
+        if (v == "auto") return CpuTopology.PhysicalCoreCount();   // physical cores — SMT barely helps GEMM
+        if (v == "max") return Environment.ProcessorCount;          // all logical, incl. SMT siblings
+        return int.TryParse(v, out var n) && n > 0 ? n : 1;
+    }
+
+    /// <summary>Worker cap for the row-parallel matmul; proxies the static <see cref="CpuKernels"/> knob.</summary>
+    public override int CpuMatMulThreads
+    {
+        get => CpuKernels.MatMulThreads;
+        set => CpuKernels.MatMulThreads = value < 1 ? 1 : value;
+    }
+
     // Lazily created only if device enumeration is requested (Cuda.* / Accelerators.*). Pure
     // CpuSimd compute never touches ILGPU.
     private Context? _ctx;

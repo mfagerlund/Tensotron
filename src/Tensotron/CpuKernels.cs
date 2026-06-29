@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Threading.Tasks;
 
 namespace Tensotron;
 
@@ -9,8 +10,12 @@ namespace Tensotron;
 /// transcendentals — is identical to the GPU path, which is what makes parity near-automatic).
 ///
 /// Scalar baseline first (correctness + the parity gate). SIMD (<c>Vector&lt;float&gt;</c>) fast
-/// paths layer on top in a later phase, gated by the same fixtures. Single-threaded by Tensotron's
-/// law; GPU atomics become plain <c>+=</c> here (and are deterministic in this fixed loop order).
+/// paths layer on top, gated by the same fixtures. GPU atomics become plain <c>+=</c> here (and are
+/// deterministic in this fixed loop order). The only multi-threaded op is matmul, and only when
+/// opted in (<see cref="MatMulThreads"/> &gt; 1): it splits output *rows* across workers, which is
+/// bit-identical to the serial result (each row computed by one worker, same K-reduction order), so
+/// it does not relax Tensotron's parity law. Tensotron's single-thread rule still forbids calling
+/// ops concurrently from *different* threads — this is parallelism strictly *within* one op.
 /// </summary>
 internal static class CpuKernels
 {
@@ -382,20 +387,37 @@ internal static class CpuKernels
     // contiguous along the contraction axis (aKs==bKs==1 — the Linear-forward / MatMulNT layout),
     // the k-reduction is a SIMD dot product; otherwise fall back to the strided scalar loop
     // (covers the transposed backward matmuls, which contract along a non-unit stride).
+    // ---- multi-threading knobs (within-op row parallelism only — see ParallelRows) ----
+    // Off by default (1). The runtime sets these from TENSOTRON_CPU_THREADS / the CpuMatMulThreads
+    // property. Row-parallel matmul is bit-identical to serial (each output row is computed by exactly
+    // one worker, same K-reduction order), so it does NOT relax the parity contract.
+    public static int MatMulThreads = 1;
+    // Below this FLOP count (2*M*N*K) the thread-dispatch overhead outweighs the win — stay serial.
+    public static long MatMulParallelMinFlops = 1_000_000;
+
     public static void MatMul2D(float[] a, float[] b, float[] c,
         int M, int N, int K, int aMs, int aKs, int bKs, int bNs)
     {
-        if (aKs == 1 && bKs == 1)
+        int threads = MatMulThreads;
+        if (threads > 1 && M >= 2 && 2L * M * N * K >= MatMulParallelMinFlops)
         {
-            MatMul2DDot(a, b, c, M, N, K, aMs, bNs);
+            int chunks = Math.Min(threads, M);
+            ParallelRows(M, chunks, threads,
+                (s, e) => MatMul2DRange(a, b, c, N, K, aMs, aKs, bKs, bNs, s, e));
             return;
         }
-        if (bNs == 1)
-        {
-            MatMul2DAxpy(a, b, c, M, N, K, aMs, aKs, bKs);
-            return;
-        }
-        for (int m = 0; m < M; m++)
+        MatMul2DRange(a, b, c, N, K, aMs, aKs, bKs, bNs, 0, M);
+    }
+
+    // Compute output rows [mStart, mEnd). Each path's body for a row touches only that row's slice of
+    // c (c[m*N .. m*N+N)), reads of a/b are disjoint or shared-read — so distinct row ranges never
+    // race, and the result equals the serial [0,M) computation element-for-element.
+    private static void MatMul2DRange(float[] a, float[] b, float[] c, int N, int K,
+        int aMs, int aKs, int bKs, int bNs, int mStart, int mEnd)
+    {
+        if (aKs == 1 && bKs == 1) { MatMul2DDot(a, b, c, N, K, aMs, bNs, mStart, mEnd); return; }
+        if (bNs == 1) { MatMul2DAxpy(a, b, c, N, K, aMs, aKs, bKs, mStart, mEnd); return; }
+        for (int m = mStart; m < mEnd; m++)
         {
             int aBase = m * aMs;
             int cBase = m * N;
@@ -410,14 +432,32 @@ internal static class CpuKernels
         }
     }
 
+    // Split [0,M) into `chunks` contiguous row blocks and run them on the thread pool, capped at
+    // `degree`. One Parallel.For iteration per block (not per row) keeps scheduling overhead flat and
+    // each worker's rows contiguous (cache-friendly). Only reached for large GEMMs (the FLOP gate),
+    // where this overhead is negligible against the work.
+    private static void ParallelRows(int M, int chunks, int degree, Action<int, int> body)
+    {
+        int per = (M + chunks - 1) / chunks;
+        var po = new ParallelOptions { MaxDegreeOfParallelism = degree };
+        Parallel.For(0, chunks, po, ci =>
+        {
+            int s = ci * per;
+            if (s >= M) return;
+            int e = Math.Min(M, s + per);
+            body(s, e);
+        });
+    }
+
     // Contraction-contiguous GEMM: each output is a vectorized dot product over K. Four independent
     // vector accumulators hide the FMA-latency dependency chain (the single-accumulator form is
     // latency-bound, not throughput-bound, for K in the tens-to-hundreds).
-    private static void MatMul2DDot(float[] a, float[] b, float[] c, int M, int N, int K, int aMs, int bNs)
+    private static void MatMul2DDot(float[] a, float[] b, float[] c, int N, int K, int aMs, int bNs,
+        int mStart, int mEnd)
     {
         int vw = Vector<float>.Count;
         int step = vw * 4;
-        for (int m = 0; m < M; m++)
+        for (int m = mStart; m < mEnd; m++)
         {
             int aBase = m * aMs;
             int cBase = m * N;
@@ -448,12 +488,13 @@ internal static class CpuKernels
     // the transposed backward matmuls). For each (m,k) we broadcast A[m,k] and FMA the contiguous
     // B[k,:] row into the contiguous C[m,:] row, so the SIMD runs over N. C is accumulated, so it is
     // cleared first (don't rely on the allocator zeroing).
-    private static void MatMul2DAxpy(float[] a, float[] b, float[] c, int M, int N, int K, int aMs, int aKs, int bKs)
+    private static void MatMul2DAxpy(float[] a, float[] b, float[] c, int N, int K, int aMs, int aKs, int bKs,
+        int mStart, int mEnd)
     {
-        Array.Clear(c, 0, M * N);
+        Array.Clear(c, mStart * N, (mEnd - mStart) * N);   // clear only this worker's row block
         int vw = Vector<float>.Count;
         int nVec = N - (N % vw);
-        for (int m = 0; m < M; m++)
+        for (int m = mStart; m < mEnd; m++)
         {
             int aBase = m * aMs;
             int cBase = m * N;

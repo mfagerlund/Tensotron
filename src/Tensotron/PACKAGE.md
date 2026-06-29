@@ -3,24 +3,30 @@
 A **PyTorch-faithful**, float32 tensor and autograd library for .NET, GPU-accelerated with
 [ILGPU](https://github.com/m4rs-mt/ILGPU).
 
-> **The law:** Tensotron mimics PyTorch in everything - naming, semantics, broadcasting,
-> gradients. If it doesn't behave like PyTorch, it's a bug. Porting PyTorch code should be
-> near-mechanical.
+> **The law:** for every op it implements, Tensotron matches PyTorch exactly - naming, semantics,
+> broadcasting, gradients (including behavior at kinks/ties/special values). Porting PyTorch code is
+> near-mechanical *within the supported surface*, which is a deliberate subset of torch.
+
+> **Scope:** feed-forward training/inference - MLPs, CNNs, small RL nets. Not yet implemented:
+> RNN/LSTM/GRU, attention/transformers, `Embedding`, `ConvTranspose`, `Conv1d`/`Conv3d`, dtypes
+> beyond float32, and PyTorch `state_dict` interop.
 
 ## Highlights
 
 - **Define-by-run autograd** - toposort backward over a named op graph; `Tensor.Backward()`.
-- **Broad op surface, every op torch-parity tested** - elementwise math + activations,
+- **Broad op surface, every implemented op torch-parity tested** - elementwise math + activations,
   broadcasting, reductions, 2D/N-D batched matmul, movement/structure ops, indexing
   (`gather`/`scatter_add`/`index_select`), `Conv2d`, `MaxPool2d`/`AvgPool2d`, LayerNorm /
   BatchNorm / GroupNorm, and the common losses (MSE, L1, Huber, BCE-with-logits, NLL,
   cross-entropy, KL-div).
 - **Training stack** - `Module`/`Sequential`/`Linear`, SGD/Adam/AdamW/RMSProp, LR schedulers,
-  Kaiming/Xavier init, `DataLoader`, save/load.
+  Kaiming/Xavier init, `DataLoader`, and full-checkpoint save/load (params + buffers + optimizer &
+  LR-scheduler state, so training resumes exactly).
 - **Runs without a GPU** - `Auto` (the default) uses CUDA when present and otherwise falls back to a
   hand-written managed/SIMD CPU backend (`TENSOTRON_BACKEND=simd`; no per-op device dispatch, ~645×
-  the ILGPU scalar CPU path at batch-1) — the fast path for small-model CPU inference/training.
-  ILGPU's scalar CPU accelerator (`TENSOTRON_BACKEND=cpu`) is kept only as a slow
+  the ILGPU scalar CPU path at batch-1) — the fast path for small-model CPU inference/training. Its
+  matmul has opt-in row parallelism (`TENSOTRON_CPU_THREADS=auto`, ~5–12× on big-batch GEMMs; off by
+  default). ILGPU's scalar CPU accelerator (`TENSOTRON_BACKEND=cpu`) is kept only as a slow
   correctness-verification reference and warns loudly when selected.
 
 ## Status

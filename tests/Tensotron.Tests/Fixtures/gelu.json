@@ -1,0 +1,143 @@
+{
+  "op": "gelu",
+  "torch_version": "2.5.1+cu121",
+  "source": "def gen_gelu():\n    \"\"\"Exact (erf) GELU \u2014 torch's DEFAULT F.gelu(approximate='none') / nn.GELU(), which is what\n    Tensotron's Gelu() uses by default. The tanh approximation is covered by the 'gelu' case in\n    unary.json (Tensotron's Gelu(approximateTanh: true)). Self-seeded so it regenerates identically\n    whether run alone or from the full pipeline.\"\"\"\n    import torch.nn.functional as TF\n    torch.manual_seed(0)\n    cases = [run_unary(\"gelu\", lambda x: TF.gelu(x), \"real\")]\n    # Boundary: include exactly 0 (gelu(0)=0, grad(0)=0.5) and a spread around it.\n    edge = [-3.0, -1.0, -0.5, 0.0, 0.5, 1.0, 3.0]\n    cases.append(run_unary_explicit(\"gelu\", \"gelu(erf) @ incl 0\", edge, [1, 7], lambda x: TF.gelu(x)))\n    return cases\n",
+  "cases": [
+    {
+      "name": "gelu",
+      "meta": {
+        "op": "gelu"
+      },
+      "inputs": [
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            1.5409960746765137,
+            -0.293428897857666,
+            -2.1787893772125244,
+            0.5684312582015991,
+            -1.0845223665237427,
+            -1.3985954523086548
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          2,
+          3
+        ],
+        "data": [
+          0.40334683656692505,
+          0.8380263447761536,
+          -0.7192575931549072,
+          -0.40334352850914,
+          -0.5966353416442871,
+          0.18203648924827576
+        ]
+      },
+      "output": {
+        "shape": [
+          2,
+          3
+        ],
+        "data": [
+          1.4459799528121948,
+          -0.11285195499658585,
+          -0.03197072818875313,
+          0.4065016508102417,
+          -0.15082088112831116,
+          -0.11324038356542587
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            2,
+            3
+          ],
+          "data": [
+            0.45411446690559387,
+            0.2283359169960022,
+            0.047681037336587906,
+            -0.3662641644477844,
+            0.060395631939172745,
+            -0.023455936461687088
+          ]
+        }
+      ]
+    },
+    {
+      "name": "gelu(erf) @ incl 0",
+      "meta": {
+        "op": "gelu"
+      },
+      "inputs": [
+        {
+          "shape": [
+            1,
+            7
+          ],
+          "data": [
+            -3.0,
+            -1.0,
+            -0.5,
+            0.0,
+            0.5,
+            1.0,
+            3.0
+          ]
+        }
+      ],
+      "grad_output": {
+        "shape": [
+          1,
+          7
+        ],
+        "data": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "output": {
+        "shape": [
+          1,
+          7
+        ],
+        "data": [
+          -0.004049867391586304,
+          -0.1586552858352661,
+          -0.1542687863111496,
+          0.0,
+          0.3457311987876892,
+          0.8413447141647339,
+          2.995950222015381
+        ]
+      },
+      "grads": [
+        {
+          "shape": [
+            1,
+            7
+          ],
+          "data": [
+            -0.011945605278015137,
+            -0.08331543207168579,
+            0.1325049102306366,
+            0.5,
+            0.867495059967041,
+            1.083315372467041,
+            1.0119456052780151
+          ]
+        }
+      ]
+    }
+  ]
+}

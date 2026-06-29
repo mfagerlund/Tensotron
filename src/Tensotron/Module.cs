@@ -12,6 +12,10 @@ public abstract class Module
 
     protected virtual IEnumerable<Module> Children => Array.Empty<Module>();
     protected virtual IEnumerable<(string name, Tensor param)> OwnParameters() => Array.Empty<(string, Tensor)>();
+    /// <summary>Persistent non-learnable state (torch buffers) — e.g. BatchNorm running mean/var.
+    /// In <see cref="StateDict"/> like torch, so save/load round-trips them; excluded from
+    /// <see cref="Parameters"/> so optimizers never touch them.</summary>
+    protected virtual IEnumerable<(string name, Tensor buffer)> OwnBuffers() => Array.Empty<(string, Tensor)>();
     protected virtual IEnumerable<(string name, Module child)> NamedChildren =>
         Children.Select((c, i) => (i.ToString(), c));
 
@@ -33,6 +37,23 @@ public abstract class Module
     }
 
     public IEnumerable<Tensor> Parameters() => NamedParameters().Select(x => x.param);
+
+    /// <summary>All persistent buffers with dotted names (torch state_dict buffer keys).</summary>
+    public IEnumerable<(string name, Tensor buffer)> NamedBuffers(string prefix = "")
+    {
+        foreach (var (n, b) in OwnBuffers()) yield return (prefix + n, b);
+        foreach (var (cn, c) in NamedChildren)
+            foreach (var kv in c.NamedBuffers($"{prefix}{cn}."))
+                yield return kv;
+    }
+
+    /// <summary>The full state_dict: learnable parameters followed by persistent buffers (torch
+    /// merges both into one dict; their dotted names never collide). This is what gets serialized.</summary>
+    public IEnumerable<(string name, Tensor tensor)> StateDict(string prefix = "")
+    {
+        foreach (var kv in NamedParameters(prefix)) yield return kv;
+        foreach (var kv in NamedBuffers(prefix)) yield return kv;
+    }
 
     public void ZeroGrad()
     {
@@ -100,7 +121,7 @@ public sealed class Activation : Module
     public static Activation Relu() => new(TensorOps.Relu);
     public static Activation Tanh() => new(TensorOps.Tanh);
     public static Activation Sigmoid() => new(TensorOps.Sigmoid);
-    public static Activation Gelu() => new(TensorOps.Gelu);
+    public static Activation Gelu() => new(x => TensorOps.Gelu(x));
 }
 
 /// <summary>Inverted dropout (torch.nn.Dropout): active only in training mode.</summary>

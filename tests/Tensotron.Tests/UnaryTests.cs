@@ -25,7 +25,9 @@ public class UnaryTests
         ["tanh"] = TensorOps.Tanh,
         ["sigmoid"] = TensorOps.Sigmoid,
         ["relu"] = TensorOps.Relu,
-        ["gelu"] = TensorOps.Gelu,
+        // unary.json's "gelu" case is the tanh approximation; the exact-erf default is in gelu.json
+        // (see GeluTests).
+        ["gelu"] = x => TensorOps.Gelu(x, approximateTanh: true),
         ["softplus"] = TensorOps.Softplus,
     };
 
