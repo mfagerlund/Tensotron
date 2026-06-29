@@ -21,11 +21,18 @@ A **PyTorch-faithful**, float32 tensor and autograd library for .NET, GPU-accele
 
 ## Status
 
-`0.1.0-alpha`. **Correctness-first:** matmul currently runs on custom ILGPU kernels (a cuBLAS
-swap is planned) and the runtime synchronizes after essentially every launch rather than
-queueing on the async stream. Buffers are `IDisposable` (deterministic opt-in release);
-zero-copy views never free their parent's buffer. A pooling/arena allocator and async-stream
-execution are on the roadmap.
+`0.1.0-alpha`. Large matmul runs on **cuBLAS SGEMM** (CUDA; matches PyTorch FP32 throughput at
+scale), with tiled/naive ILGPU kernels otherwise. The runtime is **async**: kernels queue on
+ILGPU's in-order default stream and synchronize **only** at host pulls (`ToArray`/`Item`), not
+per launch. A size-bucketed **caching allocator** (opt-in via `Dispose`/`DisposeGraph`) reuses
+device buffers, and shape/stride metadata is uploaded once and cached. Adam/SGD are fused
+single-kernel updates. Buffers are `IDisposable` (deterministic opt-in release); zero-copy views
+never free their parent's buffer. The per-op host-side autograd graph (a `Tensor`/`GradNode` per
+op every step) is the remaining cost for very small models — measured ~95% host-bound — and now has
+an opt-in escape hatch: `TensorRuntime.Capture`/`CapturedGraph.Replay` records a fixed-shape step
+once and replays its device launches buffer-to-buffer (~2.5–2.9× on a small step; spike). Still
+unoptimized: cross-op kernel fusion. float32-only *storage* by design (so no FP16/BF16 path), but TF32 tensor-core
+matmul is an available one-line knob (`CuBlas.MathMode`), currently left off for exact FP32.
 
 ## Quick start
 

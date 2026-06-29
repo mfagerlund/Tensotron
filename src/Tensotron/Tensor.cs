@@ -174,8 +174,7 @@ public sealed partial class Tensor : IDisposable
     public static Tensor Zeros(Shape shape)
     {
         var t = Allocate(shape);
-        Runtime.NoteHostUpload();
-        t.Buffer.CopyFromCPU(new float[shape.Size]);
+        Runtime.ZeroBuffer(t.Buffer); // device-side memset, not a host→device copy of zeros
         return t;
     }
 
@@ -243,6 +242,15 @@ public sealed partial class Tensor : IDisposable
             throw new InvalidOperationException($"CopyFromHost length {data.Length} != {Shape.Size} {Shape}.");
         Runtime.NoteHostUpload();
         Buffer.CopyFromCPU(data);
+    }
+
+    /// <summary>Overwrite this tensor's contents from host data, in place, keeping the same device
+    /// buffer (so a captured trace's launches stay valid). Used to feed the next minibatch into a
+    /// <see cref="CapturedGraph"/>'s stable input tensor between replays.</summary>
+    public Tensor Upload(float[] data)
+    {
+        CopyFromHost(data);
+        return this;
     }
 
     /// <summary>In-place copy of another tensor's data into this one (torch's <c>copy_</c>).</summary>

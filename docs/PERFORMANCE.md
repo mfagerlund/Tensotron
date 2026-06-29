@@ -4,14 +4,22 @@ Status as of commit `5856212` ("Async kernel launches + device-side parameter up
 Measured on an **NVIDIA RTX 4090** (.NET 10, Release).
 
 > **⚡ Update — most of this roadmap is now implemented.** The Tier-0/1/2/3 work below was carried
-> out and measured; see [`PERFORMANCE_LOG.md`](PERFORMANCE_LOG.md) for the per-experiment log.
+> out and measured; see [`PERFORMANCE_LOG.md`](PERFORMANCE_LOG.md) for the per-experiment log and
+> [`PERFORMANCE_VS_PYTORCH.md`](PERFORMANCE_VS_PYTORCH.md) for the head-to-head against PyTorch.
 > Headline (default MLP): **72.3 → ~1.4 ms/step (~50×)**; launches 126→36, host uploads 316→3.
 > Compute-bound 1024×2048: **46 → 4.4 ms** (cuBLAS). Large-batch alloc cliff 4096×2048: **~3100 → 78 ms**
-> (caching allocator). Done: fused optimizer kernels ✅, cached stride/dim uploads ✅, caching device
-> allocator ✅ (opt-in via `DisposeGraph`), tiled GEMM ✅, cuBLAS ✅, `Linear` no-transpose-copy ✅.
-> **Key conclusion:** every realistic regime is launch/allocation-bound, *not* compute-bound — the
-> wins came from removing per-op overhead, not from faster math. Not done (low ROI / future work):
-> gradient-buffer recycling, automatic arena, more launch fusion, tree-reduction. All 74 tests green.
+> (caching allocator). MNIST-CNN step **28.8 → ~2.7–5 ms (~6–10×)** via a chunked parallel reduction
+> for the conv bias gradient (E7). Done: fused optimizer kernels ✅, cached stride/dim uploads ✅,
+> caching device allocator ✅ (opt-in via `DisposeGraph`), tiled GEMM ✅, cuBLAS ✅,
+> `Linear` no-transpose-copy ✅, chunked parallel reduction ✅, device-resident MaxPool argmax ✅.
+> **vs PyTorch (4090):** GEMM ties torch FP32 at scale (same cuBLAS), we win small MLPs, torch leads
+> conv ~1.7–1.9× (FP32) / ~2.5× (cuDNN-TF32). **Key conclusion:** every realistic regime is
+> launch/allocation/host-bound, *not* compute-bound — the wins came from removing per-op overhead,
+> not faster math. **Trace/replay landed (spike):** `Capture`/`Replay` a fixed-shape step measured
+> **95% host-bound** and gave **~2.5–2.9×** by re-firing recorded launches with no graph rebuild. Not
+> done (low ROI / blocked): CUDA Graph capture (ILGPU exposes no API), trace/replay productionization
+> (buffer reclamation, conv/pool ops), gradient-buffer recycling, automatic arena, more launch fusion.
+> Tests green.
 
 ## 1. Benchmark
 

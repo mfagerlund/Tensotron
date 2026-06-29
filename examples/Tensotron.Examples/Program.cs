@@ -15,13 +15,20 @@ switch (which)
     case "bench": BenchExample.Run(); break;
     case "benchsweep": case "sweep": BenchExample.Sweep(); break;
     case "benchpool": case "pool": BenchExample.Pool(); break;
+    case "benchladder": case "ladder": BenchExample.Ladder(); break;
+    case "convbreakdown": case "convbd": BenchExample.ConvBreakdown(); break;
+    case "cnnphases": BenchExample.CnnPhases(); break;
+    case "gemmtf32": case "tf32": BenchExample.GemmTf32(); break;
+    case "inference": case "infer": BenchExample.InferenceLatency(); break;
+    case "stepbreakdown": case "breakdown": BenchExample.StepBreakdown(); break;
+    case "replaybench": case "replay": BenchExample.ReplayBench(); break;
     case "all":
         XorExample.Run();
         SpiralExample.Run();
         RegressionExample.Run();
         break;
     default:
-        Console.WriteLine($"Unknown example '{which}'. Try: xor | spiral | regression | bench | benchsweep | all");
+        Console.WriteLine($"Unknown example '{which}'. Try: xor | spiral | regression | bench | benchsweep | benchpool | ladder | all");
         Environment.ExitCode = 1;
         break;
 }

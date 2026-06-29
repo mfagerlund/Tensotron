@@ -6,7 +6,10 @@ namespace Tensotron.Tests;
 /// The caching allocator (size-bucketed pool fed by Tensor.Dispose) and the per-step
 /// graph recycle (Tensor.DisposeGraph) must be numerically transparent: reusing device
 /// buffers must not change any result. Trains the same net twice — once recycling each
-/// step's graph into the pool, once not — and requires bit-identical final parameters.
+/// step's graph into the pool, once not — and requires the final parameters to match.
+/// Tolerance, not bit-equality: the parallel reduction accumulates with atomics (per the
+/// "not bitwise-deterministic" design), so two runs of the same math differ at ~1e-7;
+/// pooling corruption would diverge by orders of magnitude, which this still catches.
 /// </summary>
 public class AllocatorPoolTests
 {
@@ -47,8 +50,10 @@ public class AllocatorPoolTests
         var pool2 = w2Pool.ToArray();
 
         Assert.Equal(plain1.Length, pool1.Length);
-        for (int i = 0; i < plain1.Length; i++) Assert.Equal(plain1[i], pool1[i]); // exact
-        for (int i = 0; i < plain2.Length; i++) Assert.Equal(plain2[i], pool2[i]);
+        for (int i = 0; i < plain1.Length; i++)
+            Assert.True(MathF.Abs(plain1[i] - pool1[i]) <= 1e-3f, $"w1[{i}] {pool1[i]} vs {plain1[i]}");
+        for (int i = 0; i < plain2.Length; i++)
+            Assert.True(MathF.Abs(plain2[i] - pool2[i]) <= 1e-3f, $"w2[{i}] {pool2[i]} vs {plain2[i]}");
     }
 
     [Fact]

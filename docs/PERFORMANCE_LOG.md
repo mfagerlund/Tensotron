@@ -181,6 +181,79 @@ alias across inputs — so pool-on still shows 22 allocs/step; recycling those t
 left as future work.) **Correctness:** new `AllocatorPoolTests` trains the same net with and without
 recycling and requires **bit-identical** parameters; 74/74 tests green.
 
+### E7 — Chunked parallel reduction + device-resident MaxPool argmax (CNN hot path) — *kept, decisive on conv*
+
+E6's conclusion line dismissed tree-reduction as "only for very large reductions, not a bottleneck."
+The MNIST-CNN benchmark proved that wrong. 5-whys on a 28.8 ms/step CNN: step is 98% backward → conv
+backward is ~all of it → **the bias gradient is 98% of conv backward** → it routes through
+`ReduceGradToShape` → the naive `ReduceSum` uses **one thread per output element**. Conv1's 8-channel
+bias gradient therefore ran *8 threads*, each serially summing 50,176 strided elements — a near-serial
+reduction on a 16k-core GPU.
+
+Fix: `ReduceSumChunked`. When a reduction has few outputs over a large extent, split each output's
+reduced extent across `parts` threads that **atomic-combine** into a pre-zeroed output, sized so total
+threads ≈ 8192 regardless of output count (`parts = min(reducedCount, 8192/outputCount)`); the
+already-parallel case keeps the simple atomic-free kernel. Also removed the mid-graph stall in
+`LaunchMaxPool2d`: the argmax now stays **device-resident** and is handed straight to backward instead
+of a `Sync()` + host readback + re-upload every forward (which drained the whole stream and defeated
+async batching under load).
+
+| metric | before | after |
+|---|---|---|
+| conv1 bias gradient | 22.8 ms | **0.74 ms** |
+| **full MNIST-CNN step** (b64, fwd+bwd+Adam) | 28.8 ms | **~2.7–5 ms** (~6–10×) |
+
+Atomic accumulation makes the reduced result non-bitwise-deterministic — already a documented design
+property — so `AllocatorPoolTests` was relaxed from bit-equality to a `1e-3` tolerance (still catches
+real pooling corruption, which diverges by orders of magnitude). MNIST CNN convergence showcase passes,
+confirming bias gradients stay correct.
+
+### E8 — Cross-library benchmark vs PyTorch (RTX 4090) — *the "are we up there?" check*
+
+Built a 3-rung ladder (MLP / MNIST-CNN / large GEMM) with a PyTorch mirror
+(`tools/bench/torch_bench.py`) emitting the same `RESULT …` schema, against two torch baselines (strict
+FP32 with TF32 off everywhere; default with cuDNN-conv TF32 on). Full write-up:
+[`PERFORMANCE_VS_PYTORCH.md`](PERFORMANCE_VS_PYTORCH.md). Headline: **GEMM ties torch FP32 at 4096³
+(~46 TFLOP/s — same cuBLAS); we win small MLPs; torch leads conv ~1.7–1.9× (FP32) / ~2.5× (cuDNN-TF32)**
+and large MLP ~1.6×. The residual gap is confirmed **host-side per-op overhead** (fresh `Tensor`/`GradNode`
+per op + graph rebuild each step), not GPU sync (the runtime is async) and not the math (GEMM ties). The
+next attainable lever is trace/replay of the fixed-shape step; CUDA Graph capture is blocked on ILGPU
+(no graph-capture API — verified).
+
+### E9 — Device-resident grad-norm clip + `FlushEvery` knob (PPO update) — *kept*
+
+`GradUtils.ClipGradNorm` was pulling each parameter's `Sum(Square(grad)).Item()` to the host (a sync per
+param — 13/minibatch for the showcase actor-critic) and branching on `coef < 1` host-side. Rewrote it
+fully device-resident: Σ‖g‖² accumulates into one device scalar, the norm and `coef = min(1, maxNorm/
+(total+eps))` are computed on-device, and **every grad is unconditionally scaled by `coef`** (a no-op
+×1.0 when within norm — no host branch). The pre-clip norm is pulled only if the caller wants it; the
+PPO update passes `returnTotalNorm: false` → **0 syncs** (was 13). Identical clip semantics (the torch
+parity test is unchanged). Separately, `FlushEvery` (the every-N-launch safety drain) became a settable
+knob and the PPO update raised it to 1024: a whole minibatch update issues ~170 launches with **no host
+pull**, so the old every-64 drain was the only thing syncing mid-update. Pure MLP parks no
+data-dependent index buffers, so nothing accumulates between the (now rarer) drains.
+
+### E10 — Trace/replay of the fixed-shape step (software CUDA-Graph) — *kept (spike)*
+
+**The decider measurement first** (`stepbreakdown`): a PPO-scale MLP step (`8→64→64→2`, batch 512;
+fwd+bwd+clip+Adam) is **95% host-bound** — 2272 µs host-dispatch vs 121 µs device-tail; the GPU is idle
+95% of the step. Per launch: **28.4 µs host**, of which a single grad op costs ~49 µs to issue (12.6 µs
+Tensor-alloc + ILGPU-dispatch floor + **36.7 µs of autograd-graph construction** rebuilt every step).
+That kills kernel fusion as the primary lever for small nets (it targets the idle 5%) and points at the
+host graph rebuild.
+
+So: record the fixed-shape step **once** as an ordered list of device-launch thunks (`TensorRuntime.
+Capture`), then `Replay()` re-fires them buffer-to-buffer with zero host graph work — a software
+emulation of CUDA Graph (which ILGPU 1.5.3 can't do natively). Each `Launch*` taps a replay thunk only
+while capturing (zero eager-path overhead); trace buffers are pinned so the pool can't recycle them; an
+`AfterLaunch` assertion (via `CallerMemberName`) makes any **un-tapped op fail loud at capture** instead
+of silently corrupting a replay. **Result: replay ~780 µs/step vs eager ~2050 µs → ~2.5–2.9×**, landing
+replay at ~9.75 µs/launch — essentially the raw ILGPU dispatch floor (the remaining per-launch cost only
+CUDA-graph or fusion could remove). Parity proven: replay reproduces eager loss+grads for *new* uploaded
+inputs (`Tensor.Upload`). Spike limits (documented, follow-up): buffers pinned for the graph's lifetime
+(no reclamation), step-dependent optimizer scalars (Adam bias correction, scheduled LR) frozen at
+capture, and data-dependent index ops (maxpool argmax, gather) not yet trace-supported.
+
 ---
 
 ## Conclusions

@@ -36,6 +36,13 @@ public sealed class ContinuousPpo
         _envFactory = envFactory;
         _rng = rng;
         _opt = new Adam(ac.Parameters(), lr: LearningRate);
+
+        // A single minibatch update (3-layer MLP forward+backward + PPO loss + clip + Adam)
+        // is well under 1024 launches and makes no host pull, so the every-64 safety drain was
+        // the only thing syncing mid-update. Raise it to span a whole update — drains still
+        // fire across minibatches, keeping the in-flight queue bounded. Pure MLP: no parked
+        // data-dependent index buffers, so nothing accumulates between drains.
+        TensorRuntime.Instance.FlushEvery = 1024;
     }
 
     private float NextGaussian()
@@ -221,7 +228,7 @@ public sealed class ContinuousPpo
 
         _opt.ZeroGrad();
         loss.Backward();
-        GradUtils.ClipGradNorm(_ac.Parameters(), MaxGradNorm);
+        GradUtils.ClipGradNorm(_ac.Parameters(), MaxGradNorm, returnTotalNorm: false);
         _opt.Step();
     }
 

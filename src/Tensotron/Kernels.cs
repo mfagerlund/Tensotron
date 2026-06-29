@@ -179,6 +179,63 @@ internal static class Kernels
         outp[oi] = acc;
     }
 
+    /// <summary>
+    /// Parallel reduction for the few-outputs / large-reduced-extent case (e.g. conv bias
+    /// gradient: reduce (N,O,H,W) over N,H,W to (O,) — only O outputs, so the one-thread-per-output
+    /// <see cref="ReduceSum"/> uses just O threads each looping N·H·W). Here the global id is
+    /// (oi, part) with <paramref name="parts"/> threads per output; each strides the reduced extent
+    /// by <paramref name="parts"/> and atomic-adds its partial. Output must be pre-zeroed.
+    /// </summary>
+    public static void ReduceSumChunked(
+        Index1D gid,
+        int rank,
+        int parts,
+        ArrayView<float> inp,
+        ArrayView<float> outp,
+        ArrayView<int> inDims,
+        ArrayView<int> inStrides,
+        ArrayView<int> outDims,
+        ArrayView<int> reduceMask)
+    {
+        int oi = gid / parts;
+        int part = gid % parts;
+
+        int rem = oi;
+        int baseOff = 0;
+        for (int ax = rank - 1; ax >= 0; ax--)
+        {
+            int od = outDims[ax];
+            int idx = rem % od;
+            rem /= od;
+            if (reduceMask[ax] == 0)
+                baseOff += idx * inStrides[ax];
+        }
+
+        int reducedCount = 1;
+        for (int ax = 0; ax < rank; ax++)
+            if (reduceMask[ax] == 1) reducedCount *= inDims[ax];
+
+        float acc = 0f;
+        for (int r = part; r < reducedCount; r += parts)
+        {
+            int rr = r;
+            int off = baseOff;
+            for (int ax = rank - 1; ax >= 0; ax--)
+            {
+                if (reduceMask[ax] == 1)
+                {
+                    int rd = inDims[ax];
+                    int idx = rr % rd;
+                    rr /= rd;
+                    off += idx * inStrides[ax];
+                }
+            }
+            acc += inp[off];
+        }
+
+        Atomic.Add(ref outp[oi], acc);
+    }
+
     /// <summary>Generic axis reduction (struct-generic over the reduce op). Mirrors ReduceSum.</summary>
     public static void Reduce<TR>(
         Index1D oi,

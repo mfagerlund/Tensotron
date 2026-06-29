@@ -213,20 +213,42 @@ public static class GradUtils
     /// Clip the global L2 norm of all parameter gradients to <paramref name="maxNorm"/>,
     /// in place. Returns the pre-clip total norm. Matches torch.nn.utils.clip_grad_norm_.
     /// </summary>
-    public static float ClipGradNorm(IReadOnlyList<Tensor> parameters, float maxNorm, float eps = 1e-6f)
+    /// <remarks>
+    /// Fully device-resident: Σ‖g‖² accumulates into a single device scalar, the norm and
+    /// scale coefficient are computed on-device, and every grad is unconditionally scaled by
+    /// coef (a no-op multiply by 1.0 when within norm) — so there is no host
+    /// <c>if (coef &lt; 1)</c> branch and no per-parameter <c>.Item()</c> pull. The ONLY sync
+    /// is the final pull of the pre-clip norm for the return value; pass
+    /// <paramref name="returnTotalNorm"/> = false (as the PPO update does) to skip it and run
+    /// the whole clip at zero syncs. Clip semantics are identical either way.
+    /// </remarks>
+    public static float ClipGradNorm(IReadOnlyList<Tensor> parameters, float maxNorm,
+                                     float eps = 1e-6f, bool returnTotalNorm = true)
     {
         using (Tensor.NoGradScope())
         {
-            double sumSq = 0;
+            // Σ‖g‖² as a single device scalar — add per-param sum-of-squares on-device.
+            Tensor? sumSq = null;
             foreach (var p in parameters)
-                if (p.Grad != null) sumSq += Sum(Square(p.Grad)).Item();
-            float total = MathF.Sqrt((float)sumSq);
+            {
+                if (p.Grad == null) continue;
+                var s = Sum(Square(p.Grad));
+                sumSq = sumSq == null ? s : Add(sumSq, s);
+            }
+            if (sumSq == null) return 0f;   // no grads: norm 0, nothing to scale
 
-            float coef = maxNorm / (total + eps);
-            if (coef < 1f)
-                foreach (var p in parameters)
-                    if (p.Grad != null) p.Grad.CopyInPlace(Mul(p.Grad, Scalar(coef)));
-            return total;
+            var total = Sqrt(sumSq);        // device scalar; pre-clip norm
+            // coef = min(1, maxNorm / (total + eps)); ratio is ≥ 0 so clamp-low never bites.
+            var coef = Clamp(Div(Scalar(maxNorm), Add(total, Scalar(eps))), 0f, 1f);
+
+            // Unconditionally scale every grad by coef — multiplying by 1.0 within norm is a
+            // cheap no-op, and avoids the host branch + sync the conditional version needed.
+            foreach (var p in parameters)
+                if (p.Grad != null) p.Grad.CopyInPlace(Mul(p.Grad, coef));
+
+            // `total` is a distinct buffer computed before the in-place scaling was queued, so
+            // (in-order stream) this reads the genuine pre-clip norm. Skipped when not wanted.
+            return returnTotalNorm ? total.Item() : float.NaN;
         }
     }
 }

@@ -24,15 +24,18 @@ public static partial class TensorOps
 
         var outShape = new Shape(n, c, ho, wo);
         var outBuf = Runtime.Allocate(outShape.Size);
-        var argmax = Runtime.LaunchMaxPool2d(x.Buffer, outBuf, cfg);
+        bool needsGrad = !Tensor.NoGrad && Tensor.NeedsGrad(x);
+        // Keep the argmax on the device when we'll need it for backward — no host round-trip.
+        var argmax = Runtime.LaunchMaxPool2d(x.Buffer, outBuf, cfg, keepArgmax: needsGrad);
         var result = new Tensor(outShape, outBuf);
 
-        if (!Tensor.NoGrad && Tensor.NeedsGrad(x))
+        if (needsGrad)
         {
+            var dArg = argmax!; // device-resident argmax, consumed directly by backward
             result.Node = new GradNode("MaxPool2d", new[] { x }, g =>
             {
                 var gx = Tensor.Zeros(x.Shape);
-                Runtime.LaunchMaxPool2dGrad(g.Buffer, gx.Buffer, argmax);
+                Runtime.LaunchMaxPool2dGrad(g.Buffer, gx.Buffer, dArg);
                 x.AddGrad(gx);
             });
         }
