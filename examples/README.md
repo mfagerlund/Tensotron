@@ -13,8 +13,8 @@ dotnet run --project examples/Tensotron.Examples spiral       # spiral classific
 dotnet run --project examples/Tensotron.Examples regression   # sine curve fit (+ regression.svg)
 ```
 
-No GPU required — without CUDA, Tensotron falls back to ILGPU's CPU accelerator, so these
-run anywhere (just slower). SVGs are written to the current working directory.
+No GPU required — without CUDA, Tensotron falls back to the fast managed/SIMD CPU backend, so these
+run anywhere (just slower than a GPU). SVGs are written to the current working directory.
 
 | Example | What it shows | Output |
 |---|---|---|

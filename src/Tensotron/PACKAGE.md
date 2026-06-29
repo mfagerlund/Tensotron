@@ -17,9 +17,11 @@ A **PyTorch-faithful**, float32 tensor and autograd library for .NET, GPU-accele
   cross-entropy, KL-div).
 - **Training stack** - `Module`/`Sequential`/`Linear`, SGD/Adam/AdamW/RMSProp, LR schedulers,
   Kaiming/Xavier init, `DataLoader`, save/load.
-- **Runs without a GPU** - uses CUDA when present, else ILGPU's CPU accelerator. A hand-written
-  managed/SIMD CPU backend (`TENSOTRON_BACKEND=simd`) is also available for fast small-model CPU
-  inference/training (no per-op device dispatch; ~645× the ILGPU scalar CPU path at batch-1).
+- **Runs without a GPU** - `Auto` (the default) uses CUDA when present and otherwise falls back to a
+  hand-written managed/SIMD CPU backend (`TENSOTRON_BACKEND=simd`; no per-op device dispatch, ~645×
+  the ILGPU scalar CPU path at batch-1) — the fast path for small-model CPU inference/training.
+  ILGPU's scalar CPU accelerator (`TENSOTRON_BACKEND=cpu`) is kept only as a slow
+  correctness-verification reference and warns loudly when selected.
 
 ## Status
 

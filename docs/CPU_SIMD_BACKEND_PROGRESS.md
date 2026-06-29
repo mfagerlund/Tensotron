@@ -74,6 +74,18 @@ GPU kernels are untouched), plus `AddInto`:
 - Faithfulness note: dropped an `av==0 → skip` AXPY micro-opt — it turned `0·NaN` into `0`, diverging
   from torch/the GPU path (correctness over the sparse-gradient speedup; bwd 1.8→2.4 ms).
 
+### Post-landing — `Auto` now prefers SIMD-CPU + loud slow-path warning (2026-06-29)
+A consumer (Evolvatron.Walker) on a GPU-less box silently landed on the **slow ILGPU scalar CPU
+accelerator** because `Auto` fell back to it. Fixed:
+- **`Create()` resolves `Auto` itself**: probes for a CUDA device (`CudaPresent()`, a throwaway
+  CUDA-only context — can't call `Cuda.IsAvailable()` mid-`Lazy`-construction) and routes
+  GPU→`IlgpuRuntime(Cuda)`, no-GPU→`CpuSimdRuntime`. `Auto` can no longer reach the ILGPU CPU path.
+- **`WarnIlgpuCpuIsSlow()`** — a big stderr banner fired from the `IlgpuRuntime` ctor whenever the
+  selected accelerator is `AcceleratorType.CPU` (point-of-truth, catches every route). The ILGPU CPU
+  accelerator is now reachable only via an explicit `TENSOTRON_BACKEND=cpu`.
+- Verified the 4-way matrix on the 4090 box: default→CUDA; `CUDA_VISIBLE_DEVICES=-1`→**CPU-SIMD**;
+  `cpu`→`CPUAccelerator`+banner; `simd`→CPU-SIMD silent. Gates green (default 78+3, `-Simd` 66+3).
+
 ## Conclusions
 
 **The thesis held, decisively.** ILGPU's "CPU" cost was per-op device dispatch, not arithmetic; a

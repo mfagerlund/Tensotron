@@ -6,12 +6,14 @@ using ILGPU.Runtime.Cuda;
 namespace Tensotron;
 
 /// <summary>
-/// Which backend the runtime drives. <see cref="Auto"/> prefers a CUDA GPU and falls back to
-/// ILGPU's CPU accelerator; <see cref="Cuda"/> / <see cref="Cpu"/> force one of the ILGPU devices.
+/// Which backend the runtime drives. <see cref="Auto"/> (the default) prefers a CUDA GPU and, when
+/// none is present, falls back to the fast managed/SIMD CPU backend (<see cref="CpuSimd"/>) — NOT
+/// the slow ILGPU CPU accelerator. <see cref="Cuda"/> forces the GPU (throws if absent).
 /// <see cref="CpuSimd"/> selects the hand-written, ILGPU-free managed/SIMD CPU backend (no per-op
-/// device dispatch) — the fast path for small-model CPU inference/training. NOTE: the ILGPU
-/// <see cref="Cpu"/> accelerator is *scalar* and carries full per-op dispatch overhead; it is kept
-/// as a correctness/debug reference, not the fast CPU path.
+/// device dispatch) — the fast path for small-model CPU inference/training.
+/// <see cref="Cpu"/> forces ILGPU's *scalar* CPU accelerator: a correctness/verification reference
+/// ONLY (full per-op device-dispatch overhead, ~600x slower at batch-1) — selecting it prints a
+/// loud warning. Use <see cref="CpuSimd"/> for real CPU work.
 /// </summary>
 public enum TensorBackend { Auto, Cuda, Cpu, CpuSimd }
 
@@ -63,9 +65,63 @@ public abstract class TensorRuntime : IDisposable
             _ => TensorBackend.Auto,
         };
 
-    private static TensorRuntime Create() => RequestedBackend == TensorBackend.CpuSimd
-        ? new CpuSimdRuntime()
-        : new IlgpuRuntime(RequestedBackend);
+    private static TensorRuntime Create()
+    {
+        switch (RequestedBackend)
+        {
+            case TensorBackend.CpuSimd:
+                return new CpuSimdRuntime();
+            case TensorBackend.Auto:
+                // Best available: a CUDA GPU if present, else the FAST managed/SIMD CPU backend.
+                // NOT the slow ILGPU scalar CPU accelerator — that is a verification-only reference,
+                // reachable only by an explicit TENSOTRON_BACKEND=cpu.
+                return CudaPresent() ? new IlgpuRuntime(TensorBackend.Cuda) : new CpuSimdRuntime();
+            default: // Cuda or Cpu — both go to ILGPU; the constructor warns LOUDLY if it actually
+                     // lands on the scalar CPU accelerator, whatever the path that got it there.
+                return new IlgpuRuntime(RequestedBackend);
+        }
+    }
+
+    /// <summary>
+    /// Big, unmissable banner emitted whenever the live backend is ILGPU's *scalar* CPU accelerator.
+    /// That path is a correctness/verification reference only — full per-op device dispatch, ~600x
+    /// slower than the managed/SIMD CPU backend at batch-1. Anything real should be on CUDA or
+    /// <c>TENSOTRON_BACKEND=simd</c>.
+    /// </summary>
+    protected static void WarnIlgpuCpuIsSlow()
+    {
+        const string bar = "************************************************************************";
+        Console.Error.WriteLine();
+        Console.Error.WriteLine(bar);
+        Console.Error.WriteLine("**  WARNING: Tensotron is running on the ILGPU *SCALAR* CPU accelerator. **");
+        Console.Error.WriteLine("**                                                                      **");
+        Console.Error.WriteLine("**  This is a SLOW correctness/verification reference ONLY -- it carries **");
+        Console.Error.WriteLine("**  full per-op device-dispatch overhead (~600x slower than the managed  **");
+        Console.Error.WriteLine("**  CPU backend at batch-1). DO NOT use it for real workloads.           **");
+        Console.Error.WriteLine("**                                                                      **");
+        Console.Error.WriteLine("**  For fast CPU execution set:  TENSOTRON_BACKEND=simd                  **");
+        Console.Error.WriteLine("**  (Auto already prefers SIMD-CPU when no CUDA GPU is present.)         **");
+        Console.Error.WriteLine(bar);
+        Console.Error.WriteLine();
+    }
+
+    /// <summary>
+    /// Probe for a CUDA device without touching <see cref="Instance"/> (we are mid-construction of
+    /// it, so <see cref="Cuda.IsAvailable"/> would re-enter the <see cref="Lazy{T}"/>). Uses a
+    /// throwaway CUDA-only context; returns false if CUDA is absent or the driver errors.
+    /// </summary>
+    private static bool CudaPresent()
+    {
+        try
+        {
+            using var ctx = Context.Create(b => b.Cuda());
+            return ctx.Devices.Any(d => d.AcceleratorType == AcceleratorType.Cuda);
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     // ---- lightweight instrumentation (perf bench only; negligible when unread) ----
     /// <summary>Kernel launches + device copies issued.</summary>
@@ -247,6 +303,11 @@ internal sealed class IlgpuRuntime : TensorRuntime
         // Enable CPU + all GPUs (Default), then pick one device per the requested backend.
         Context = Context.Create(b => b.Default().EnableAlgorithms());
         Accelerator = SelectDevice(Context, backend).CreateAccelerator(Context);
+
+        // The ILGPU CPU accelerator is the slow scalar verification reference, never the fast path.
+        // Whatever route selected it (explicit cpu, or any future fallback), say so unmistakably.
+        if (Accelerator.AcceleratorType == AcceleratorType.CPU)
+            WarnIlgpuCpuIsSlow();
 
         _addInto = Accelerator.LoadAutoGroupedStreamKernel<
             Index1D, ArrayView<float>, ArrayView<float>>(Kernels.AddInto);

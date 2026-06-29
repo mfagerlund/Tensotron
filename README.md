@@ -17,8 +17,11 @@ Tensotron is a GPU tensor and autograd library for .NET, built on **ILGPU** with
 > every op runs as a synchronous managed (scalar + `Vector<float>` matmul) kernel — no per-op device
 > dispatch. It passes the **same** torch-fixture parity suite (`tools/run-tests.ps1 -Simd`). It takes
 > batch-1 control-net inference from **6.8 ms** (ILGPU's *scalar* CPUAccelerator, dominated by
-> dispatch) to **~10 µs** (~645×), and at batch≥8 beats hand-written scalar C#. The ILGPU `cpu`
-> backend remains as a reference/debug device. See [`docs/CPU_SIMD_BACKEND_PLAN.md`](docs/CPU_SIMD_BACKEND_PLAN.md)
+> dispatch) to **~10 µs** (~645×), and at batch≥8 beats hand-written scalar C#.
+> **`Auto` (the default) now falls back to this SIMD backend when no CUDA GPU is present** — not to
+> the slow ILGPU CPU accelerator. That ILGPU `cpu` accelerator is kept *only* as a
+> correctness/verification reference (`TENSOTRON_BACKEND=cpu`); selecting it prints a loud warning,
+> because it is ~600× slower than the managed path at batch-1. See [`docs/CPU_SIMD_BACKEND_PLAN.md`](docs/CPU_SIMD_BACKEND_PLAN.md)
 > and [`docs/CPU_SIMD_BACKEND_PROGRESS.md`](docs/CPU_SIMD_BACKEND_PROGRESS.md).
 
 > **The law:** Tensotron mimics PyTorch in everything — naming, semantics, broadcasting, gradients. If it doesn't behave like PyTorch, it's a bug. Converting PyTorch code to Tensotron should be near-mechanical, because the names and behavior are what you'd expect.
@@ -168,8 +171,10 @@ Without a CUDA GPU the convergence demos report **Skipped** (they gate on `Cuda.
 via `SkippableFact`), so `-Showcase` is safe to run anywhere — on a CPU-only box it just skips
 the expensive training instead of grinding for minutes on the CPU fallback.
 
-Tests run on ILGPU's accelerator — CUDA if present, else the CPU accelerator (so the full
-suite runs without a GPU).
+The default test run uses `Auto` — CUDA if present, otherwise the managed/SIMD CPU backend — so the
+full suite runs without a GPU. `tools/run-tests.ps1 -Simd` forces the SIMD backend explicitly; the
+ILGPU scalar CPU accelerator (`TENSOTRON_BACKEND=cpu`) is exercised only when you deliberately ask
+for that verification reference.
 
 ## Status
 
