@@ -33,6 +33,42 @@ public static partial class TensorOps
         return (outDims, aStride, bStride);
     }
 
+    // Broadcast output dims across three operands (torch rules), for the ternary select.
+    private static int[] BroadcastDims(Shape a, Shape b, Shape c)
+    {
+        int r = Math.Max(a.Rank, Math.Max(b.Rank, c.Rank));
+        var outDims = new int[r];
+        for (int j = 0; j < r; j++)
+        {
+            int da = DimFromRight(a, r, j), db = DimFromRight(b, r, j), dc = DimFromRight(c, r, j);
+            int od = Math.Max(da, Math.Max(db, dc));
+            if ((da != 1 && da != od) || (db != 1 && db != od) || (dc != 1 && dc != od))
+                throw new InvalidOperationException($"Cannot broadcast {a}, {b}, {c} (axis {j}).");
+            outDims[j] = od;
+        }
+        return outDims;
+    }
+
+    private static int DimFromRight(Shape s, int rank, int j)
+    {
+        int ax = j - (rank - s.Rank);
+        return ax >= 0 ? s.Dims[ax] : 1;
+    }
+
+    // Per-operand broadcast strides aligned to outDims (stride 0 on a broadcast/absent axis).
+    private static int[] BroadcastStridesTo(Shape s, int[] outDims)
+    {
+        int r = outDims.Length;
+        var stride = new int[r];
+        for (int j = 0; j < r; j++)
+        {
+            int ax = j - (r - s.Rank);
+            int d = ax >= 0 ? s.Dims[ax] : 1;
+            stride[j] = (ax >= 0 && d == outDims[j]) ? s.Strides[ax] : 0;
+        }
+        return stride;
+    }
+
     /// <summary>
     /// Sum a gradient back to a (smaller, broadcast) input shape. Runs during
     /// backward (under NoGrad). Always returns a fresh tensor (no aliasing).

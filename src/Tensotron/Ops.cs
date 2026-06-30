@@ -43,14 +43,18 @@ public readonly struct SqDiffOp : IBinaryOp
     public float Apply(float a, float b) { float d = a - b; return d * d; }
 }
 
+// torch.maximum / torch.minimum propagate NaN: if either operand is NaN the result is NaN.
+// The plain `a > b ? a : b` would silently return the non-NaN side, hiding the NaN.
 public readonly struct MaximumOp : IBinaryOp
 {
-    public float Apply(float a, float b) => a > b ? a : b;
+    public float Apply(float a, float b)
+        => ILGPU.Algorithms.XMath.IsNaN(a) ? a : (ILGPU.Algorithms.XMath.IsNaN(b) ? b : (a > b ? a : b));
 }
 
 public readonly struct MinimumOp : IBinaryOp
 {
-    public float Apply(float a, float b) => a < b ? a : b;
+    public float Apply(float a, float b)
+        => ILGPU.Algorithms.XMath.IsNaN(a) ? a : (ILGPU.Algorithms.XMath.IsNaN(b) ? b : (a < b ? a : b));
 }
 
 // Comparisons return 1f/0f and carry no gradient.

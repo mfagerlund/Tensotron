@@ -79,6 +79,13 @@ internal sealed class CpuSimdRuntime : TensorRuntime
         Launches++;
     }
 
+    public override void LaunchSelect(TensorStorage cond, TensorStorage a, TensorStorage b, TensorStorage outv,
+        int[] outDims, int[] cStride, int[] aStride, int[] bStride)
+    {
+        CpuKernels.Select(H(cond), H(a), H(b), H(outv), outDims, cStride, aStride, bStride);
+        Launches++;
+    }
+
     public override void LaunchUnaryFwd<TOp>(TensorStorage x, TensorStorage outv)
     {
         CpuKernels.UnaryFwd<TOp>(H(x), H(outv));

@@ -20,10 +20,19 @@ public static partial class TensorOps
 
     private static void PowBackward(Tensor a, Tensor b, Tensor res, Tensor g)
     {
-        // ∂a = g * b * a^(b-1) = g * b * res / a
-        if (Tensor.NeedsGrad(a)) a.AddGrad(ReduceGradToShape(Mul(Mul(g, b), Div(res, a)), a.Shape));
-        // ∂b = g * res * log(a)
-        if (Tensor.NeedsGrad(b)) b.AddGrad(ReduceGradToShape(Mul(Mul(g, res), Log(a)), b.Shape));
+        // ∂a = g * b * a^(b-1), as a fresh power rather than g*b*res/a: at a base of exactly 0 the
+        // latter is 0/0 = NaN, whereas a^(b-1) gives torch's finite limit (d/da a²|₀ = 0, a¹|₀ = 1).
+        // This is what makes x.Pow(2) differentiable at x == 0.
+        if (Tensor.NeedsGrad(a))
+            a.AddGrad(ReduceGradToShape(Mul(Mul(g, b), Pow(a, Sub(b, Scalar(1f)))), a.Shape));
+        // ∂b = g * res * log(a), but 0 where a ≤ 0 (torch masks this: ln of a non-positive base is
+        // undefined). Clamping the log argument keeps it finite so the a==0 lane is res·log = 0
+        // rather than 0·−∞ = NaN, and Where zeroes the a≤0 lanes to match torch exactly.
+        if (Tensor.NeedsGrad(b))
+        {
+            var logA = Where(Gt(a, Scalar(0f)), Log(Maximum(a, Scalar(1e-30f))), Scalar(0f));
+            b.AddGrad(ReduceGradToShape(Mul(Mul(g, res), logA), b.Shape));
+        }
     }
 
     // ---- maximum / minimum (grad to the selected side; ties split 0.5, matching torch) ----

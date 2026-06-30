@@ -41,6 +41,28 @@ internal static class CpuKernels
         }
     }
 
+    // Ternary select (cond>0.5 ? a : b) — the managed twin of Kernels.Select. A true branch, so
+    // a NaN/Inf in the unselected operand is never multiplied in (torch.where / masked_fill).
+    public static void Select(float[] cond, float[] a, float[] b, float[] outv,
+        int[] outDims, int[] cStride, int[] aStride, int[] bStride)
+    {
+        int rank = outDims.Length;
+        for (int i = 0; i < outv.Length; i++)
+        {
+            int rem = i, cOff = 0, aOff = 0, bOff = 0;
+            for (int ax = rank - 1; ax >= 0; ax--)
+            {
+                int d = outDims[ax];
+                int idx = rem % d;
+                rem /= d;
+                cOff += idx * cStride[ax];
+                aOff += idx * aStride[ax];
+                bOff += idx * bStride[ax];
+            }
+            outv[i] = cond[cOff] > 0.5f ? a[aOff] : b[bOff];
+        }
+    }
+
     public static void UnaryFwd<TOp>(float[] x, float[] outv) where TOp : struct, IUnaryOp
     {
         var op = default(TOp);

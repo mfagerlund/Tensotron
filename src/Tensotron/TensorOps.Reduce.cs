@@ -68,8 +68,12 @@ public static partial class TensorOps
             bool isMax = typeof(TR) == typeof(MaxReduce);
             result.Node = new GradNode(name, new[] { x }, g =>
             {
-                // Route the gradient to the single first-winning element per group
-                // (torch.max(dim).values semantics — not split across ties).
+                // Route the gradient to the single first-winning element per group, matching
+                // torch.max(dim).values / torch.min(dim).values (which backprop through the index
+                // they return). torch's *full* reduction torch.max(x) (no dim) and torch.amax
+                // instead split the gradient equally across ties; Tensotron routes first-winner
+                // uniformly, so it only differs from those two on hand-built exact ties under a
+                // full reduction — measure-zero for real-valued data.
                 var gk = g.Shape.Equals(keepShape) ? g : g.Reshape(keepShape.Dims);
                 var gx = Tensor.Zeros(x.Shape);
                 Runtime.LaunchReduceArgGrad(x.Buffer, gk.Buffer, gx.Buffer,

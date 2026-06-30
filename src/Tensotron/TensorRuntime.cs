@@ -224,6 +224,8 @@ public abstract class TensorRuntime : IDisposable
 
     public abstract void LaunchBinary<TOp>(TensorStorage a, TensorStorage b, TensorStorage outv,
         int[] outDims, int[] aStride, int[] bStride) where TOp : struct, IBinaryOp;
+    public abstract void LaunchSelect(TensorStorage cond, TensorStorage a, TensorStorage b, TensorStorage outv,
+        int[] outDims, int[] cStride, int[] aStride, int[] bStride);
     public abstract void LaunchUnaryFwd<TOp>(TensorStorage x, TensorStorage outv) where TOp : struct, IUnaryOp;
     public abstract void LaunchUnaryBwd<TOp>(TensorStorage x, TensorStorage y, TensorStorage gy, TensorStorage gx)
         where TOp : struct, IUnaryOp;
@@ -352,6 +354,8 @@ internal sealed class IlgpuRuntime : TensorRuntime
     private readonly Action<AcceleratorStream, Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
         int, int, int, int, int, int, int, int,
         ArrayView<int>, ArrayView<int>, ArrayView<int>> _matmulBatched;
+    private readonly Action<AcceleratorStream, Index1D, int, ArrayView<float>, ArrayView<float>,
+        ArrayView<float>, ArrayView<float>, ArrayView<int>, ArrayView<int>, ArrayView<int>, ArrayView<int>> _select;
 
     // Generic elementwise kernels: one per op struct, cached by type.
     private readonly ConcurrentDictionary<Type, object> _binaryKernels = new();
@@ -450,6 +454,10 @@ internal sealed class IlgpuRuntime : TensorRuntime
             Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
             int, int, int, int, int, int, int, int,
             ArrayView<int>, ArrayView<int>, ArrayView<int>>(Kernels.MatMulBatched);
+
+        _select = Accelerator.LoadAutoGroupedKernel<
+            Index1D, int, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+            ArrayView<int>, ArrayView<int>, ArrayView<int>, ArrayView<int>>(Kernels.Select);
 
         _gatherAxis = Accelerator.LoadAutoGroupedKernel<
             Index1D, int, ArrayView<float>, ArrayView<float>,
@@ -793,6 +801,20 @@ internal sealed class IlgpuRuntime : TensorRuntime
         var dB = AllocInt(bStride);
         kernel(_stream, (int)outv.Length, outDims.Length, a.View, b.View, outv.View, dOut.View, dA.View, dB.View);
         if (_capture != null) _capture.Add(() => kernel(_stream, (int)outv.Length, outDims.Length, a.View, b.View, outv.View, dOut.View, dA.View, dB.View));
+        AfterLaunch();
+    }
+
+    public override void LaunchSelect(
+        TensorStorage condS, TensorStorage aS, TensorStorage bS, TensorStorage outvS,
+        int[] outDims, int[] cStride, int[] aStride, int[] bStride)
+    {
+        var cond = B(condS); var a = B(aS); var b = B(bS); var outv = B(outvS);
+        var dOut = AllocInt(outDims);
+        var dC = AllocInt(cStride);
+        var dA = AllocInt(aStride);
+        var dB = AllocInt(bStride);
+        _select(_stream, (int)outv.Length, outDims.Length, cond.View, a.View, b.View, outv.View, dOut.View, dC.View, dA.View, dB.View);
+        if (_capture != null) _capture.Add(() => _select(_stream, (int)outv.Length, outDims.Length, cond.View, a.View, b.View, outv.View, dOut.View, dC.View, dA.View, dB.View));
         AfterLaunch();
     }
 

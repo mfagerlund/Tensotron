@@ -43,6 +43,39 @@ internal static class Kernels
         outv[i] = default(TOp).Apply(a[aOff], b[bOff]);
     }
 
+    /// <summary>
+    /// Arbitrary-rank strided ternary select with broadcasting: <c>out = cond &gt; 0.5 ? a : b</c>.
+    /// A real branch, not an arithmetic blend — so a NaN/Inf in the UNSELECTED operand never
+    /// leaks into the result (matching torch.where / masked_fill, where 0*NaN would otherwise
+    /// poison it). Output is contiguous; each input is gathered via its own broadcast strides.
+    /// </summary>
+    public static void Select(
+        Index1D i,
+        int rank,
+        ArrayView<float> cond,
+        ArrayView<float> a,
+        ArrayView<float> b,
+        ArrayView<float> outv,
+        ArrayView<int> outDims,
+        ArrayView<int> cStride,
+        ArrayView<int> aStride,
+        ArrayView<int> bStride)
+    {
+        int rem = i;
+        int cOff = 0, aOff = 0, bOff = 0;
+        for (int ax = rank - 1; ax >= 0; ax--)
+        {
+            int d = outDims[ax];
+            int idx = rem % d;
+            rem /= d;
+            cOff += idx * cStride[ax];
+            aOff += idx * aStride[ax];
+            bOff += idx * bStride[ax];
+        }
+
+        outv[i] = cond[cOff] > 0.5f ? a[aOff] : b[bOff];
+    }
+
     /// <summary>Struct-generic unary forward: out[i] = op.Forward(x[i]).</summary>
     public static void UnaryFwd<TOp>(Index1D i, ArrayView<float> x, ArrayView<float> outv)
         where TOp : struct, IUnaryOp

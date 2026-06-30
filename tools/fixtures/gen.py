@@ -230,6 +230,11 @@ def gen_binary():
                                      [1., 2., 3., 2.], [1., 2., 1., 5.], [2, 2], torch.maximum))
     cases.append(run_binary_explicit("minimum", "minimum with ties",
                                      [1., 2., 3., 2.], [1., 2., 1., 5.], [2, 2], torch.minimum))
+    # Zero base: the base gradient is b·a^(b-1) (not g·b·res/a, which is 0/0 = NaN at a==0) and the
+    # exponent gradient is masked to 0 where a ≤ 0. With a==0 (positions 0–2) torch records the
+    # finite limits: da = [1, 0, 0, 4] (1·0⁰, 2·0¹, 3·0², 2·2¹), db = 0 for the zero-base lanes.
+    cases.append(run_binary_explicit("pow", "pow zero base",
+                                     [0., 0., 0., 2.], [1., 2., 3., 2.], [2, 2], torch.pow))
     return cases
 
 
