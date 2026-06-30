@@ -382,6 +382,17 @@ public static class GradUtils
     /// </remarks>
     public static float ClipGradNorm(IReadOnlyList<Tensor> parameters, float maxNorm,
                                      float eps = 1e-6f, bool returnTotalNorm = true)
+        => ClipGradNorm(parameters, Scalar(maxNorm), eps, returnTotalNorm);
+
+    /// <summary>
+    /// As <see cref="ClipGradNorm(IReadOnlyList{Tensor}, float, float, bool)"/>, but the clip threshold is
+    /// supplied as a (broadcastable) scalar tensor. Pass a <see cref="Tensor.ScalarInput"/> so the
+    /// threshold stays live across captured-graph replays — uploading a new value between replays is
+    /// honoured — instead of a plain <c>float</c>, which the float overload bakes into the graph as a
+    /// frozen capture-time constant.
+    /// </summary>
+    public static float ClipGradNorm(IReadOnlyList<Tensor> parameters, Tensor maxNorm,
+                                     float eps = 1e-6f, bool returnTotalNorm = true)
     {
         using (Tensor.NoGradScope())
         {
@@ -397,7 +408,7 @@ public static class GradUtils
 
             var total = Sqrt(sumSq);        // device scalar; pre-clip norm
             // coef = min(1, maxNorm / (total + eps)); ratio is ≥ 0 so clamp-low never bites.
-            var coef = Clamp(Div(Scalar(maxNorm), Add(total, Scalar(eps))), 0f, 1f);
+            var coef = Clamp(Div(maxNorm, Add(total, Scalar(eps))), 0f, 1f);
 
             // Unconditionally scale every grad by coef — multiplying by 1.0 within norm is a
             // cheap no-op, and avoids the host branch + sync the conditional version needed.

@@ -185,6 +185,22 @@ public sealed partial class Tensor : IDisposable
         return t;
     }
 
+    /// <summary>
+    /// A persistent rank-0 scalar whose value you can change between captured-graph replays. Use it as a
+    /// broadcast operand inside a captured body (e.g. <c>loss = policy + value - entCoef * entropy</c>);
+    /// writing a new value with <see cref="Upload"/> before the next <see cref="CapturedGraph.Replay"/> is
+    /// honoured — exactly like feeding the next minibatch into a stable input tensor. This is how a
+    /// per-iteration coefficient (an annealed entropy / clip-ε weight, a grad-clip threshold) stays live
+    /// under capture, the same way the capturable optimizer keeps the learning rate live. A plain
+    /// <c>float</c> operand, by contrast, is baked into the kernel at capture and frozen — route anything
+    /// you anneal through this instead. Eagerly it is just a normal scalar tensor.
+    /// </summary>
+    public static Tensor ScalarInput(float value, string? name = null)
+    {
+        var t = FromShaped(new[] { value }, Array.Empty<int>());
+        return name == null ? t : t.SetName(name);
+    }
+
     public Tensor RequireGrad(bool value = true)
     {
         RequiresGrad = value;

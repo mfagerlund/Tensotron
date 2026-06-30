@@ -270,7 +270,11 @@ control-net step drops ~675 µs → ~64 µs; a 256³ cuBLAS step ~1210 µs → ~
 of the host-side software replay it falls back to when a graph can't be built. Adam bias correction
 advances on the device so training stays exact across replays; capture the body in steady state
 (allocate persistent optimizer/state buffers via one warmup step first), the same contract PyTorch's
-CUDA graphs require. Disable with `TensorRuntime.EnableCudaGraph = false`.
+CUDA graphs require. A scalar baked into a captured kernel is frozen at capture; anything you anneal
+per step stays live by reading from a device buffer instead — the learning rate via the capturable
+optimizer mode (`new Adam(…, capturable: true)`), and any other coefficient (an entropy/clip-ε weight,
+a grad-clip threshold) via `Tensor.ScalarInput(v)` refreshed with `Upload` between replays. Disable
+with `TensorRuntime.EnableCudaGraph = false`.
 
 The loss tail is fused: `MseLoss` computes `(input − target)²` and its reduction behind a **single**
 grad node instead of composing Sub→Square→Sum→Mul, since per-op autograd-node construction (~37 µs/op)

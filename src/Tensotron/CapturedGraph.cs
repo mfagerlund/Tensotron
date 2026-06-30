@@ -14,9 +14,11 @@ namespace Tensotron;
 ///
 /// Limitations (see <see cref="TensorRuntime.Capture"/> remarks): trace buffers are pinned for the
 /// graph's lifetime and released when the graph is disposed; Adam bias correction advances on the
-/// device so it stays correct across replays, but other step-dependent scalars baked into a kernel
-/// at capture (e.g. a scheduled LR) are frozen, and data-dependent index ops (maxpool argmax,
-/// gather) are not supported.
+/// device so it stays correct across replays. A step-dependent scalar baked into a kernel at capture
+/// (e.g. a scheduled LR) is frozen unless made device-resident — the LR via the capturable optimizer
+/// mode, any other annealed scalar (a loss coefficient, a grad-clip threshold) via
+/// <see cref="Tensor.ScalarInput"/> refreshed by <see cref="Tensor.Upload"/> between replays. Data-dependent
+/// index ops (maxpool argmax, gather) are not supported.
 /// </summary>
 public sealed class CapturedGraph : IDisposable
 {

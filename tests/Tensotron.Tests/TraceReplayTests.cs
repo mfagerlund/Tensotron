@@ -341,4 +341,65 @@ public class TraceReplayTests
         for (int i = 0; i < afterStep.Length; i++)
             Assert.Equal(afterStep[i], afterZero2[i]);
     }
+
+    // A coefficient routed through Tensor.ScalarInput must stay LIVE across captured-graph replays:
+    // uploading a new value before Replay changes both the forward result and the backward grads,
+    // exactly like feeding a new minibatch into a stable input buffer. This is the capture-frozen-scalar
+    // fix for annealed loss coefficients (entropy / clip-ε weight) and grad-clip thresholds — a plain
+    // float operand would bake the capture-time value into the graph and freeze it, so every replay
+    // would return the SAME loss. The body has no optimizer Step, so params stay fixed and the only
+    // thing that varies between replays is the uploaded scalar.
+    [Fact]
+    public void Captured_step_honours_live_scalar_input_per_replay()
+    {
+        Init.Seed(0);
+        const int batch = 8, inDim = 4, width = 8, outDim = 2;
+        var l1 = new Linear(inDim, width);
+        var l2 = new Linear(width, outDim);
+        var model = new Sequential(l1, Activation.Tanh(), l2);
+        var opt = new Adam(model.Parameters().ToList(), lr: 1e-3f);   // ZeroGrad only; never Step → params fixed
+
+        var rng = new Random(21);
+        float[] Rand(int n) { var a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() - 0.5); return a; }
+        var x = Tensor.FromArray(Rand(batch * inDim), batch, inDim);          // fixed input
+        var target = Tensor.FromArray(Rand(batch * outDim), batch, outDim);
+        var coef = Tensor.ScalarInput(1f, "coef");                            // persistent, uploaded per replay
+
+        Tensor Body()
+        {
+            opt.ZeroGrad();
+            var loss = TensorOps.Mul(TensorOps.MseLoss(model.Forward(x), target), coef);
+            loss.Backward();
+            return loss;
+        }
+
+        // Eager reference: loss + l1 weight grad for several distinct coefficient values (params fixed).
+        var coefs = new[] { 2f, 0.5f, 3f };
+        var expLoss = new float[coefs.Length];
+        var expGrad = new float[coefs.Length][];
+        for (int k = 0; k < coefs.Length; k++)
+        {
+            coef.Upload(new[] { coefs[k] });
+            var l = Body();
+            expLoss[k] = l.Item();
+            expGrad[k] = l1.Weight.Grad!.ToArray();
+            l.DisposeGraph();
+        }
+        // Distinct coefficients must give distinct losses — else a frozen scalar could pass trivially.
+        Assert.True(MathF.Abs(expLoss[0] - expLoss[1]) > 1e-4f);
+
+        using var g = TensorRuntime.Instance.Capture(Body);
+        if (TensorRuntime.Instance.UsesCuBlas)
+            Assert.True(g.UsesNativeGraph, "expected the captured step to fold into a native CUDA graph");
+        var gradOut = l1.Weight.Grad!;
+        for (int k = 0; k < coefs.Length; k++)
+        {
+            coef.Upload(new[] { coefs[k] });
+            g.Replay();
+            Assert.Equal(expLoss[k], g.Output.Item(), 3);
+            var gg = gradOut.ToArray();
+            for (int i = 0; i < gg.Length; i++)
+                Assert.Equal(expGrad[k][i], gg[i], 3);
+        }
+    }
 }

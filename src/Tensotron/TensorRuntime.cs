@@ -202,7 +202,10 @@ public abstract class TensorRuntime : IDisposable
     /// a device buffer. The Adam bias correction already does (advanced on-device by AdvanceAdam); for
     /// a varying learning rate, construct the optimizer with <c>capturable: true</c> (Adam/AdamW/Sgd),
     /// which reads the LR from a device scalar the <see cref="Optimizer.LearningRate"/> setter uploads.
-    /// Betas/eps/weight-decay and a clip <c>maxNorm</c> stay frozen at capture.</summary>
+    /// For any other per-replay scalar — an annealed loss coefficient, or a grad-clip threshold via the
+    /// <see cref="GradUtils.ClipGradNorm(IReadOnlyList{Tensor}, Tensor, float, bool)"/> overload — build it
+    /// with <see cref="Tensor.ScalarInput"/> and <see cref="Tensor.Upload"/> the new value between replays.
+    /// Betas/eps/weight-decay (and a clip <c>maxNorm</c> passed as a plain <c>float</c>) stay frozen at capture.</summary>
     public virtual CapturedGraph Capture(Func<Tensor> body) =>
         throw new NotSupportedException($"{GetType().Name} does not support trace capture.");
 
