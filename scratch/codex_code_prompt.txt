@@ -1,0 +1,22 @@
+You are an expert .NET / GPU / ML reviewer doing an independent, adversarial CODE review of the Tensotron library before it is announced publicly. Be skeptical and specific. Do NOT rubber-stamp.
+
+Context: Tensotron is a float32-only, PyTorch-faithful tensor + autograd library for .NET 8. Its hard law (see CLAUDE.md and README.md, read them first): every op must match PyTorch exactly — naming, semantics, broadcasting, gradients, down to behavior at kinks/ties/special values. Backends: ILGPU CUDA (cuBLAS for big GEMM) and a managed/SIMD CPU backend. Single-threaded across ops. There is a CUDA-graph / host-replay capture path.
+
+Scope of THIS review = the library CODE only (not the docs):
+- src/Tensotron/Tensor.cs, Shape.cs, autograd / Backward toposort
+- src/Tensotron/TensorOps.*.cs (Binary/Unary/Reduce/Movement/Matmul/Conv/Pool/Norm/Losses/Index/Select/Structural)
+- src/Tensotron/Kernels.cs, CpuKernels, TensorRuntime, IlgpuRuntime, CpuSimdRuntime, Ops* structs
+- Module/Conv/Pool/Norm/Optimizers/LrSchedulers/Init/DataLoader/Serialization
+- The Capture / CapturedGraph / CUDA-graph replay path
+
+Hunt specifically for:
+1. Correctness / PyTorch-parity bugs: ops whose forward or backward diverges from torch (broadcasting reduction, gradient at kinks/ties/special values, reduction order, integer-vs-float edge cases, in-place aliasing).
+2. Autograd defects: grad accumulation vs clearing, leaf-grad semantics, missing NoGrad guards, broken toposort ordering, double-free or use-after-free of intermediate buffers.
+3. Resource / lifetime: buffer ownership (OwnsBuffer), Dispose idempotency, view aliasing freeing shared buffers, leaks in no-grad/inference loops, allocator-pool reuse corrupting captured graphs.
+4. Capture/replay hazards: host scalars baked into captured kernels, state buffers not warmed before capture, data-dependent index ops under capture, stream/sync correctness.
+5. Concurrency: any op callable from multiple threads given the single-thread-across-ops constraint; the opt-in row-parallel matmul claim of bit-identical-to-serial.
+6. Numerical: NaN/Inf handling, fp32 accumulation, GELU/erf, softmax/log-sum-exp stability, clamp/min/max ties.
+
+Method: read README.md and CLAUDE.md first for the contract, then read the actual source. Cite concrete file:line for every finding. Prefer a few REAL, verified defects over a long list of speculation; mark anything you could not verify as "unverified". Rank by severity.
+
+Write your final report (and ONLY the report) to scratch/audit_codexC_report.md with sections: ## Critical, ## Correctness/Parity, ## Resource/Lifetime, ## Concurrency/Capture, ## Minor/Style, ## Things that look correct (brief). Each finding: file:line, what's wrong, why it diverges from torch/expected, suggested fix. Do not print the report to stdout — write it to the file.
