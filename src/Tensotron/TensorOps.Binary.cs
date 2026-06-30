@@ -61,12 +61,14 @@ public static partial class TensorOps
 
     // ---- parameterized activations, composed from the above ----
 
-    // Dedicated op, not Minimum(Maximum(...)): the composite tie-splits the gradient to 0.5 at
-    // the bounds, whereas torch passes the gradient through the whole closed interval [min,max].
+    // Clamp passes the gradient through the whole closed interval [min,max], matching torch; a
+    // Minimum(Maximum(...)) composite would tie-split the gradient to 0.5 at the bounds, so Clamp
+    // is a dedicated op.
     public static Tensor Clamp(Tensor x, float min, float max) => UnaryP("Clamp", new ClampOp(min, max), x);
 
-    // Dedicated unary ops (not Maximum/Minimum composites): the composite forms were wrong for
-    // slope > 1 and produced tie-split gradients at x==0 instead of torch's exact branch.
+    // LeakyRelu and Elu follow torch's exact branch at the kink: the negative side is slope*x (so
+    // slope > 1 is not max(x, slope*x)) and the gradient at x==0 takes a single branch, not a 0.5
+    // tie-split. Each is a dedicated unary op because a Maximum/Minimum composite can't express that.
     public static Tensor LeakyRelu(Tensor x, float slope = 0.01f) => UnaryP("LeakyRelu", new LeakyReluOp(slope), x);
 
     public static Tensor Elu(Tensor x, float alpha = 1f) => UnaryP("Elu", new EluOp(alpha), x);

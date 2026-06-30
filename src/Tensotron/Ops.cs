@@ -1,9 +1,9 @@
 namespace Tensotron;
 
 /// <summary>
-/// Struct-generic elementwise operator. The whole point: a single elementwise
-/// kernel is parameterized by one of these structs so each op inlines at JIT
-/// time (the same idiom ILGPU.Algorithms uses for reductions). No op-enum switch.
+/// Struct-generic elementwise operator. A single elementwise kernel is parameterized
+/// by one of these structs, so each op inlines at JIT time. (ILGPU kernels can't take
+/// a `Func`/delegate, so the operation is carried as a struct type parameter.)
 /// </summary>
 public interface IBinaryOp
 {
