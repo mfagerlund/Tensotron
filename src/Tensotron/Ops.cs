@@ -35,6 +35,14 @@ public readonly struct PowOp : IBinaryOp
     public float Apply(float a, float b) => ILGPU.Algorithms.XMath.Pow(a, b);
 }
 
+// (a − b)² in a single elementwise pass. Internal fusion primitive for the MSE loss tail;
+// not a public op (torch has no squared_difference) — its forward is bit-identical to
+// Square(Sub(a, b)).
+public readonly struct SqDiffOp : IBinaryOp
+{
+    public float Apply(float a, float b) { float d = a - b; return d * d; }
+}
+
 public readonly struct MaximumOp : IBinaryOp
 {
     public float Apply(float a, float b) => a > b ? a : b;

@@ -115,21 +115,31 @@ The remaining gap on multi-op workloads is **host-side overhead, not algorithm o
 The async stream, caching allocator, cached stride buffers, fused optimizer, parallel reductions,
 and cuBLAS path are in place, so the remaining lever is the per-op C# orchestration:
 
-- **Trace/replay the fixed-shape step (biggest attainable lever; available as a spike).** A small
-  model runs the *identical* op+buffer sequence every step, yet the autograd graph is rebuilt and a
-  fresh `Tensor`/`GradNode` allocated per op every time. A `stepbreakdown` measurement pins the cost:
-  a PPO-scale step is **95% host-bound** (2272 µs host-dispatch vs 121 µs device-tail), **36.7 µs/op
-  of which is pure autograd-graph construction**. `TensorRuntime.Capture` records the step's device
-  launches once and `CapturedGraph.Replay` re-fires them buffer-to-buffer with no host graph work (a
-  software CUDA-Graph), running ~2.5–2.9× faster per step at the raw ILGPU dispatch floor (~9.75
-  µs/launch) — confirming host overhead, not math, is the small-model cost. Productionization (buffer
-  reclamation, step-dependent optimizer scalars, conv/pool ops, PPO wiring) is follow-up.
-- **CUDA Graph capture (the endgame, but blocked).** Capture forward+backward+optimizer once and
-  replay with a single driver call → per-launch host cost goes to ~zero. **ILGPU 1.5.3 exposes no
-  graph-capture API** (verified — zero `cuGraph`/`BeginCapture` symbols in the DLL), so this needs
-  raw CUDA driver interop, not a flag flip.
-- **Conv as a single large GEMM** — fold the batch into one im2col matrix instead of a per-matrix
-  cuBLAS loop, to amortize launch overhead. Won't catch cuDNN; narrows the gap.
+- **Step capture — the biggest small-model lever, and it is in place.** A small model runs the
+  *identical* op+buffer sequence every step, yet the autograd graph is rebuilt and a fresh
+  `Tensor`/`GradNode` allocated per op every time. A `stepbreakdown` measurement pins the cost: a
+  PPO-scale step is **95% host-bound** (2272 µs host-dispatch vs 121 µs device-tail), **36.7 µs/op of
+  which is pure autograd-graph construction**. `TensorRuntime.Capture(body)` records the step's device
+  launches once; `CapturedGraph.Replay()` re-runs it with no host graph work. Two replay tiers:
+  - *Native CUDA graph* (CUDA): the recorded launches — kernels **and** cuBLAS SGEMMs — are folded
+    into one executable CUDA graph via driver interop (`cuStreamBeginCapture`/`cuGraphInstantiate`/
+    `cuGraphLaunch` through `nvcuda`) on a dedicated owned stream (ILGPU's default stream is the
+    uncapturable NULL stream), and replayed with a **single** `cuGraphLaunch`. Measured on a 4090:
+    **~5–10× per step vs eager** — a batch-1 control-net step 675 → 64 µs (10.6×), a 256³ cuBLAS step
+    1211 → 118 µs (10.2×). This erases nearly all per-launch host dispatch, the floor the software
+    tier still pays.
+  - *Software replay* (fallback / non-CUDA / `EnableCudaGraph=false`): re-fires the recorded launches
+    buffer-to-buffer at the raw ILGPU dispatch floor (~9.75 µs/launch), **~2–2.7×** per step.
+
+  Adam bias correction advances on the device so training stays exact across replays; capture in
+  steady state (persistent optimizer/state buffers allocated by a warmup step first), the contract
+  PyTorch CUDA graphs also impose. Data-dependent index ops (maxpool argmax, gather) are not
+  capturable and throw at capture time rather than corrupting a replay.
+- **Strided-batched GEMM (in place).** A constant-stride batched matmul — bmm/attention, and the
+  broadcast 2D@3D pattern conv rides — issues **one** `cublasSgemmStridedBatched` for the whole batch
+  instead of a per-matrix SGEMM loop (direct cuBLAS P/Invoke, since ILGPU binds only single-matrix
+  GEMM). On small-matrix batches where the loop is launch-bound this is **~20–200×** (e.g. batch-128
+  64³ bmm 2969 → 15 µs); it collapses to one launch, which also matters under capture/CUDA-graph.
 - **cuDNN conv** — out of scope; the fused/autotuned conv path an ILGPU-portable library doesn't chase.
 
 ## Verdict

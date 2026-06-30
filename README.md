@@ -245,30 +245,38 @@ memory; autograd intermediates stay reachable until backward and are otherwise G
 per-step `DisposeGraph` recycling) removes the device-malloc churn for code that bounds its own
 lifetimes.
 
-**Runtime optimizations:** large matmuls on cuBLAS SGEMM, async-stream execution (sync only at host
-pulls), a size-bucketed caching allocator, cached/resident stride buffers, fused Adam/SGD kernels, a
-chunked parallel reduction (so few-output/large-extent gradients like conv bias don't serialize), and
-device-resident MaxPool argmax (no mid-graph host stall). An **opt-in TF32 matmul** mode
+**Runtime optimizations:** large matmuls on cuBLAS SGEMM, **one `cublasSgemmStridedBatched` for a
+constant-stride batched matmul** (bmm/attention and the broadcast conv case — one call for the whole
+batch instead of a per-matrix loop, ~20–200× on small-matrix batches), async-stream execution (sync
+only at host pulls), a size-bucketed caching allocator, cached/resident stride buffers, fused Adam/SGD
+kernels, a chunked parallel reduction (so few-output/large-extent gradients like conv bias don't
+serialize), and device-resident MaxPool argmax (no mid-graph host stall). An **opt-in TF32 matmul** mode
 (`TensorRuntime.AllowTf32`, off by default) trades a little matmul precision for ~1.5× on the
 tensor cores — note this is a cuBLAS *math mode*, **not** a dtype: storage stays float32, so it
 doesn't violate the float32-only law. See
 [`docs/PERFORMANCE_VS_PYTORCH.md`](docs/PERFORMANCE_VS_PYTORCH.md) for the head-to-head and
 [`docs/PERFORMANCE_LOG.md`](docs/PERFORMANCE_LOG.md) for the per-experiment log.
 
+**Step capture (fixed-shape training/inference).** The dominant cost of a tiny-model step is host-side
+— a fresh `Tensor`/`GradNode` per op and a full C# autograd-graph rebuild every step (a PPO-scale step
+is ~95% host-bound). `TensorRuntime.Capture(body)` records a fixed-shape step's device launches once;
+`CapturedGraph.Replay()` re-runs it with no host graph work. On CUDA the recorded launches — kernels
+and cuBLAS SGEMMs alike — are folded into one native CUDA graph (driver interop on a dedicated stream)
+and replayed with a single `cuGraphLaunch`: **~5–10× faster per step than eager** (a batch-1
+control-net step drops ~675 µs → ~64 µs; a 256³ cuBLAS step ~1210 µs → ~120 µs), versus the ~2–2.7×
+of the host-side software replay it falls back to when a graph can't be built. Adam bias correction
+advances on the device so training stays exact across replays; capture the body in steady state
+(allocate persistent optimizer/state buffers via one warmup step first), the same contract PyTorch's
+CUDA graphs require. Disable with `TensorRuntime.EnableCudaGraph = false`.
+
+The loss tail is fused: `MseLoss` computes `(input − target)²` and its reduction behind a **single**
+grad node instead of composing Sub→Square→Sum→Mul, since per-op autograd-node construction (~37 µs/op)
+is the dominant host cost — the forward stays bit-identical and torch-pinned by the loss fixtures.
+Broader per-op kernel fusion is not a separate lever on the training loop: step capture already folds
+an entire fixed-shape step's launches into one `cuGraphLaunch`, so a fused bias+activation would save
+nothing a captured step doesn't.
+
 Next:
-- **Productionize trace/replay of the fixed-shape step.** The dominant tiny-model cost is host-side:
-  a fresh `Tensor`/`GradNode` per op plus a full C# graph rebuild every step (a PPO-scale step is
-  ~95% host-bound, ~37 µs/op of graph construction). `TensorRuntime.Capture` records the step's
-  device launches once and `CapturedGraph.Replay` re-fires them buffer-to-buffer with no host graph
-  work — a software CUDA-Graph, **~2.5–2.9× faster** per step, at the raw ILGPU dispatch floor. It is
-  an opt-in spike today; productionizing it (buffer reclamation, step-dependent optimizer scalars,
-  conv/pool index ops, PPO-loop wiring) is the open work.
-- **CUDA Graph capture** of the static train step — the endgame for fixed-arch tiny-model training
-  (would remove even the per-launch dispatch the software replay still pays), but ILGPU 1.5.3 exposes
-  no graph-capture API, so it needs raw CUDA driver interop.
-- **cuBLAS strided-batched GEMM** — one call for the whole conv/attention batch instead of a
-  per-matrix loop (needs a CUDA interop binding ILGPU doesn't ship).
-- More cross-op kernel fusion (bias+activation, MSE epilogue).
 - Optional internal launch serialization for multi-threaded callers.
 
 ## License

@@ -15,8 +15,54 @@ public static partial class TensorOps
 
     // ---------------- regression losses ----------------
 
+    /// <summary>
+    /// Mean/sum/none of (input − target)². Matches torch.nn.functional.mse_loss.
+    /// </summary>
+    /// <remarks>
+    /// Fused loss tail: one elementwise (input−target)² pass plus one reduction sit behind a
+    /// single grad node, rather than composing Sub→Square→Sum→Mul (up to four nodes — and the
+    /// dominant per-op cost is host-side graph-node construction). The forward is bit-identical
+    /// to <c>ApplyReduction(Square(Sub(input, target)), reduction)</c>; losses.json pins it to
+    /// torch and <c>MseLoss_FusedMatchesComposed</c> pins it to the composed expression across
+    /// every reduction and a broadcast case.
+    /// </remarks>
     public static Tensor MseLoss(Tensor input, Tensor target, Reduction reduction = Reduction.Mean)
-        => ApplyReduction(Square(Sub(input, target)), reduction);
+    {
+        var (outDims, aStride, bStride) = ComputeBroadcast(input.Shape, target.Shape);
+        var outShape = new Shape(outDims);
+        int count = outShape.Size;
+
+        Tensor result;
+        using (Tensor.NoGradScope())
+        {
+            var perBuf = Runtime.Allocate(outShape.Size);
+            Runtime.LaunchBinary<SqDiffOp>(input.Buffer, target.Buffer, perBuf, outDims, aStride, bStride);
+            var per = new Tensor(outShape, perBuf);
+            result = reduction switch
+            {
+                Reduction.None => per,
+                Reduction.Sum => Sum(per),
+                Reduction.Mean => Mul(Sum(per), Scalar(1f / count)),
+                _ => throw new ArgumentOutOfRangeException(nameof(reduction)),
+            };
+        }
+
+        if (!Tensor.NoGrad && (Tensor.NeedsGrad(input) || Tensor.NeedsGrad(target)))
+        {
+            // d/dinput (input−target)² = 2·(input−target)·g. For None, g is per-element; for
+            // Sum/Mean g is a scalar that broadcasts, and Mean folds 1/count into the scale.
+            float gScale = reduction == Reduction.Mean ? 2f / count : 2f;
+            result.Node = new GradNode("MseLoss", new[] { input, target }, g =>
+            {
+                var diff = Sub(input, target);
+                var ga = Mul(Mul(g, Scalar(gScale)), diff);
+                if (Tensor.NeedsGrad(input)) input.AddGrad(ReduceGradToShape(ga, input.Shape));
+                if (Tensor.NeedsGrad(target)) target.AddGrad(ReduceGradToShape(Neg(ga), target.Shape));
+            });
+        }
+
+        return result;
+    }
 
     public static Tensor L1Loss(Tensor input, Tensor target, Reduction reduction = Reduction.Mean)
         => ApplyReduction(Abs(Sub(input, target)), reduction);

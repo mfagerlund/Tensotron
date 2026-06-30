@@ -213,4 +213,66 @@ public class TraceReplayTests
         g2.Replay();
         Assert.False(float.IsNaN(g2.Output.Item()));
     }
+
+    // The point of capture on CUDA: the recorded launches fold into ONE native CUDA graph, so replay
+    // is a single cuGraphLaunch (UsesNativeGraph), not N host dispatches. Asserts the graph engages
+    // AND still reproduces eager results for new inputs uploaded into the same input buffer.
+    [Fact]
+    public void Native_cuda_graph_is_used_and_reproduces_eager()
+    {
+        Init.Seed(0);
+        const int batch = 16, inDim = 4, width = 8, outDim = 2;
+        var model = new Sequential(new Linear(inDim, width), Activation.Tanh(), new Linear(width, outDim));
+        var opt = new Adam(model.Parameters().ToList(), lr: 1e-3f);   // ZeroGrad only; params fixed
+        var rng = new Random(7);
+        float[] Rand(int n) { var a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() - 0.5); return a; }
+        var target = Tensor.FromArray(Rand(batch * outDim), batch, outDim);
+        var input = Tensor.FromArray(Rand(batch * inDim), batch, inDim);
+        Tensor Body() { opt.ZeroGrad(); var l = TensorOps.MseLoss(model.Forward(input), target); l.Backward(); return l; }
+
+        var inputs = new[] { Rand(batch * inDim), Rand(batch * inDim) };
+        var expLoss = new float[inputs.Length];
+        for (int t = 0; t < inputs.Length; t++) { input.Upload(inputs[t]); var l = Body(); expLoss[t] = l.Item(); l.DisposeGraph(); }
+
+        using var graph = TensorRuntime.Instance.Capture(Body);
+        if (TensorRuntime.Instance.UsesCuBlas)   // CUDA backend -> a native graph must have been built
+            Assert.True(graph.UsesNativeGraph, "expected the captured step to fold into a native CUDA graph");
+        for (int t = 0; t < inputs.Length; t++)
+        {
+            input.Upload(inputs[t]);
+            graph.Replay();
+            Assert.Equal(expLoss[t], graph.Output.Item(), 3);
+        }
+    }
+
+    // A step whose matmul is large enough (M,N,K >= 64) to take the cuBLAS SGEMM path, captured into
+    // the native graph. Proves cuBLAS launches are graph-capturable (else the build would fail and
+    // replay silently fall back), and that the graph reproduces eager.
+    [Fact]
+    public void Native_cuda_graph_captures_cublas_gemm()
+    {
+        Init.Seed(0);
+        const int batch = 128, inDim = 128, outDim = 128;   // M,N,K >= 64 -> cuBLAS path
+        var model = new Sequential(new Linear(inDim, outDim));
+        var opt = new Adam(model.Parameters().ToList(), lr: 1e-4f); // ZeroGrad only; params fixed
+        var rng = new Random(9);
+        float[] Rand(int n) { var a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() - 0.5); return a; }
+        var target = Tensor.FromArray(Rand(batch * outDim), batch, outDim);
+        var input = Tensor.FromArray(Rand(batch * inDim), batch, inDim);
+        Tensor Body() { opt.ZeroGrad(); var l = TensorOps.MseLoss(model.Forward(input), target); l.Backward(); return l; }
+
+        var inputs = new[] { Rand(batch * inDim), Rand(batch * inDim) };
+        var expLoss = new float[inputs.Length];
+        for (int t = 0; t < inputs.Length; t++) { input.Upload(inputs[t]); var l = Body(); expLoss[t] = l.Item(); l.DisposeGraph(); }
+
+        using var graph = TensorRuntime.Instance.Capture(Body);
+        if (TensorRuntime.Instance.UsesCuBlas)
+            Assert.True(graph.UsesNativeGraph, "cuBLAS GEMM should be capturable into the native CUDA graph");
+        for (int t = 0; t < inputs.Length; t++)
+        {
+            input.Upload(inputs[t]);
+            graph.Replay();
+            Assert.Equal(expLoss[t], graph.Output.Item(), 2);
+        }
+    }
 }

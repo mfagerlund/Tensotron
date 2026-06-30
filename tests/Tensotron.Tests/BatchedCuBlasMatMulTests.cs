@@ -50,6 +50,16 @@ public class BatchedCuBlasMatMulTests
             Assert.True(MathF.Abs(got[i] - exp[i]) <= tol, $"{tag}[{i}] {got[i]} != {exp[i]}");
     }
 
+    // On a CUDA box the strided-batched SGEMM entry point must resolve, so the two parity tests below
+    // actually exercise the single-call path (and thereby prove it correct), not the fallback loop.
+    [Fact]
+    public void StridedBatchedGemm_PathIsAvailable_OnCublas()
+    {
+        var rt = TensorRuntime.Instance;
+        if (rt.UsesCuBlas)
+            Assert.True(rt.UsesStridedBatchedGemm, "cublasSgemmStridedBatched should resolve on a CUDA box");
+    }
+
     [Fact]
     public void BatchedBmm_ForwardAndGrads_MatchCpu()
     {
