@@ -39,8 +39,9 @@ device buffers, and shape/stride metadata is uploaded once and cached. Adam/SGD 
 single-kernel updates. Buffers are `IDisposable` (deterministic opt-in release); zero-copy views
 never free their parent's buffer. The per-op host-side autograd graph (a `Tensor`/`GradNode` per
 op every step) is the dominant cost for very small models — ~95% host-bound — with an opt-in escape
-hatch: `TensorRuntime.Capture`/`CapturedGraph.Replay` records a fixed-shape step once and replays
-its device launches buffer-to-buffer (~2.5–2.9× faster on a small step). Cross-op kernel fusion is
+hatch: `TensorRuntime.Capture`/`CapturedGraph.Replay` records a fixed-shape step once; on CUDA the
+recorded launches fold into one native CUDA-graph `cuGraphLaunch` (~6–8× per step), with a
+buffer-to-buffer software replay fallback (~2–2.7×) off CUDA. Cross-op kernel fusion is
 not implemented. float32-only *storage* by design (so no FP16/BF16 path), but TF32 tensor-core
 matmul is an available one-line knob (`TensorRuntime.AllowTf32`), currently left off for exact FP32.
 

@@ -124,7 +124,11 @@ public sealed partial class Tensor : IDisposable
             if (!seen.Add(t)) return;
             if (t.Node == null) return;                 // leaf: stop, never free params/inputs
             foreach (var inp in t.Node.Inputs) Go(inp);
-            if (!ReferenceEquals(t, this) && t.OwnsBuffer && !t.IsDisposed)
+            // Never recycle a buffer the root tensor shares: when `this` is a zero-copy view
+            // (Reshape/Squeeze/Flatten/Detach/Mv/1D-dot output), its owning input backs the
+            // root's storage — freeing it would return live memory the caller still reads to the pool.
+            if (!ReferenceEquals(t, this) && !ReferenceEquals(t.Buffer, Buffer)
+                && t.OwnsBuffer && !t.IsDisposed)
                 t.Dispose();                            // recycle this interior activation
         }
         Go(this);

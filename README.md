@@ -33,7 +33,7 @@ For the reinforcement-learning demo — a PPO controller driving the corridor ab
 
 ![CPU inference latency: Tensotron SIMD vs PyTorch CPU](docs/img/cpu_inference.png)
 
-At training scale and on the GPU, Tensotron is in PyTorch's league — it matches PyTorch on FP32 GEMM (both call cuBLAS `Sgemm`), is ~1.9× faster on a small-batch MLP step, roughly par on a large MLP, and trails ~2–3× on conv (per-op host overhead plus cuDNN's fused conv kernels). TF32 tensor cores — which Tensotron forgoes by being FP32-only — are the throughput ceiling on large GEMM, but don't help these overhead-bound small steps.
+At training scale and on the GPU, Tensotron is in PyTorch's league — it matches PyTorch on FP32 GEMM (both call cuBLAS `Sgemm`), is ~1.9× faster on a small-batch MLP step, roughly par on a large MLP, and trails ~2–3× on conv (per-op host overhead plus cuDNN's fused conv kernels). TF32 tensor cores — an opt-in `AllowTf32` math mode, off by default — are the throughput ceiling on large GEMM, but don't help these overhead-bound small steps.
 
 ![GPU training step and FP32 GEMM throughput vs PyTorch](docs/img/gpu_training.png)
 
@@ -148,7 +148,7 @@ foreach (var n in order.Reversed())
 
 ### The hard parts
 
-- **Matmul.** A 2D GEMM core with rank/broadcast/autograd choreography in the portable layer. Handles, PyTorch-style: 1D@1D (dot→scalar), 1D@2D, 2D@1D, 2D@2D, and N-D batched with **broadcast batch dims**; rank promotion then squeeze-back; and backward `dA = dC @ Bᵀ`, `dB = Aᵀ @ dC` **with batch-dim reduction**. Three tiers behind one interface, picked by size: **cuBLAS SGEMM** (`M,N,K ≥ 64` on CUDA — vendor-tuned, matches PyTorch FP32 at scale), a hand-tiled shared-memory kernel (the CPU large path), and the naive one-thread-per-output kernel for tiny/skinny products. Batched matmul loops cuBLAS per matrix above a work threshold (ILGPU 1.5.3 exposes no strided-batched entry point).
+- **Matmul.** A 2D GEMM core with rank/broadcast/autograd choreography in the portable layer. Handles, PyTorch-style: 1D@1D (dot→scalar), 1D@2D, 2D@1D, 2D@2D, and N-D batched with **broadcast batch dims**; rank promotion then squeeze-back; and backward `dA = dC @ Bᵀ`, `dB = Aᵀ @ dC` **with batch-dim reduction**. Three tiers behind one interface, picked by size: **cuBLAS SGEMM** (`M,N,K ≥ 64` on CUDA — vendor-tuned, matches PyTorch FP32 at scale), a hand-tiled shared-memory ILGPU kernel (the CUDA fallback when cuBLAS doesn't apply), and the naive one-thread-per-output kernel for tiny/skinny products; the managed CPU backend has its own `Vector<float>` matmul. A constant-stride batched matmul above a work threshold issues a single `cublasSgemmStridedBatched` (a direct P/Invoke, since ILGPU's CuBlas binds only single-matrix GEMM); non-constant-stride batches fall back to a per-matrix cuBLAS loop.
 - **Elementwise: struct-generic kernels.** ILGPU kernels can't take a `Func<float,float>`, so each op is a `struct IOp { float Apply(...) }` passed as a generic type parameter and inlined at JIT. A single arbitrary-rank strided kernel — global thread id → multi-dim index via the broadcaster's strides (stride-0 = broadcast) — covers every rank with no rank ceiling.
 - **Stay on device.** Data is a `MemoryBuffer1D<float>`. Materialize to host **only** on explicit `.ToArray()`/`.Item()`. The eager per-op model (one kernel launch per op, in-place gradient accumulation) is accepted for correctness first; cross-op fusion comes later, behind the same surface.
 - **Sync is the enemy, not launch count.** Every op runs on ILGPU's in-order default stream; the stream is drained **only** at host pulls (`ToArray`/`Item`) plus a periodic safety valve (every 64 launches) to bound the in-flight queue. So hundreds of tiny kernels queue async and the device drains them in order. Two things keep the queue cheap to refill: compiled kernels are cached (never recompiled), and the small `dims`/`strides` int buffers — identical every step for a fixed-shape model — are **uploaded once and cached by content** (`_intCache`), not re-uploaded per launch. Cutting launch *count* further (fusing the compounds PyTorch fuses — `addcmul`, bias+activation) is a later step; the optimizer and reductions are already fused/parallel.
@@ -265,8 +265,8 @@ doesn't violate the float32-only law. See
 is ~95% host-bound). `TensorRuntime.Capture(body)` records a fixed-shape step's device launches once;
 `CapturedGraph.Replay()` re-runs it with no host graph work. On CUDA the recorded launches — kernels
 and cuBLAS SGEMMs alike — are folded into one native CUDA graph (driver interop on a dedicated stream)
-and replayed with a single `cuGraphLaunch`: **~5–10× faster per step than eager** (a batch-1
-control-net step drops ~675 µs → ~64 µs; a 256³ cuBLAS step ~1210 µs → ~120 µs), versus the ~2–2.7×
+and replayed with a single `cuGraphLaunch`: **~6–8× faster per step than eager** (a batch-1
+control-net step 1252 µs → 149 µs, a batch-512 PPO step 1290 µs → 225 µs), versus the ~2–2.7×
 of the host-side software replay it falls back to when a graph can't be built. Adam bias correction
 advances on the device so training stays exact across replays; capture the body in steady state
 (allocate persistent optimizer/state buffers via one warmup step first), the same contract PyTorch's
