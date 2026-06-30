@@ -192,7 +192,17 @@ public abstract class TensorRuntime : IDisposable
     /// the Adam step state, any lazily-built parameter) must already be allocated before capture, so
     /// the recorded step does not contain one-time zero-init that would re-run — and corrupt — on
     /// every replay. Run at least one eager warmup step first (the same requirement as PyTorch's CUDA
-    /// graphs). Per-step grad zeroing is fine; it is meant to re-run each replay.</summary>
+    /// graphs). Per-step grad zeroing is fine; it is meant to re-run each replay.
+    ///
+    /// FROZEN SCALARS: a scalar consumed inside the body is baked at capture time if it arrives as a
+    /// by-value launch argument or a <c>Scalar(v)</c> literal materialized during capture — changing
+    /// it between replays has no effect. A scalar read from a PERSISTENT DEVICE BUFFER is NOT frozen:
+    /// an <see cref="Tensor.Upload"/> to that buffer between replays is honoured by the next replay
+    /// (the same mechanism that feeds new inputs). So anything that must vary per replay has to live in
+    /// a device buffer. The Adam bias correction already does (advanced on-device by AdvanceAdam); for
+    /// a varying learning rate, construct the optimizer with <c>capturable: true</c> (Adam/AdamW/Sgd),
+    /// which reads the LR from a device scalar the <see cref="Optimizer.LearningRate"/> setter uploads.
+    /// Betas/eps/weight-decay and a clip <c>maxNorm</c> stay frozen at capture.</summary>
     public virtual CapturedGraph Capture(Func<Tensor> body) =>
         throw new NotSupportedException($"{GetType().Name} does not support trace capture.");
 
@@ -262,6 +272,18 @@ public abstract class TensorRuntime : IDisposable
     public abstract void LaunchAdvanceAdam(TensorStorage adv, float b1, float b2);
     public abstract void LaunchSgd(TensorStorage p, TensorStorage g, TensorStorage buf,
         float lr, float momentum, float weightDecay, float dampening, float nesterov, float hasBuf);
+
+    /// <summary><see cref="LaunchAdam"/> with the learning rate read from a length-1 device buffer
+    /// (<paramref name="lrBuf"/>) so it can vary across captured-graph replays, and the AdamW factor
+    /// computed on-device from <paramref name="decoupledWd"/> (0 for plain Adam). See
+    /// <see cref="Kernels.AdamStepCapturable"/> and the capturable optimizer path.</summary>
+    public abstract void LaunchAdamCapturable(TensorStorage p, TensorStorage g, TensorStorage m, TensorStorage v,
+        float b1, float oneMinusB1, float b2, float oneMinusB2,
+        TensorStorage lrBuf, float eps, TensorStorage adv, float coupledWd, float decoupledWd);
+    /// <summary><see cref="LaunchSgd"/> with the learning rate read from a length-1 device buffer
+    /// (the capturable path — see <see cref="LaunchAdamCapturable"/>).</summary>
+    public abstract void LaunchSgdCapturable(TensorStorage p, TensorStorage g, TensorStorage buf,
+        TensorStorage lrBuf, float momentum, float weightDecay, float dampening, float nesterov, float hasBuf);
 
     public abstract void Dispose();
 }
@@ -360,6 +382,10 @@ internal sealed class IlgpuRuntime : TensorRuntime
     private readonly Action<AcceleratorStream, Index1D, ArrayView<float>, float, float> _advanceAdam;
     private readonly Action<AcceleratorStream, Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
         float, float, float, float, float, float> _sgdStep;
+    private readonly Action<AcceleratorStream, Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+        float, float, float, float, ArrayView<float>, float, ArrayView<float>, float, float> _adamStepCapturable;
+    private readonly Action<AcceleratorStream, Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+        ArrayView<float>, float, float, float, float, float> _sgdStepCapturable;
 
     public IlgpuRuntime(TensorBackend backend)
     {
@@ -460,6 +486,12 @@ internal sealed class IlgpuRuntime : TensorRuntime
         _sgdStep = Accelerator.LoadAutoGroupedKernel<
             Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
             float, float, float, float, float, float>(Kernels.SgdStep);
+        _adamStepCapturable = Accelerator.LoadAutoGroupedKernel<
+            Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+            float, float, float, float, ArrayView<float>, float, ArrayView<float>, float, float>(Kernels.AdamStepCapturable);
+        _sgdStepCapturable = Accelerator.LoadAutoGroupedKernel<
+            Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
+            ArrayView<float>, float, float, float, float, float>(Kernels.SgdStepCapturable);
 
         // cuBLAS for the compute-bound matmul regime (vendor-tuned SGEMM). CUDA only; the
         // tiled/naive kernels remain the CPU path and the small-matmul path.
@@ -1309,6 +1341,35 @@ internal sealed class IlgpuRuntime : TensorRuntime
         _sgdStep(_stream, (int)p.Length, p.View, g.View, buf.View,
             lr, momentum, weightDecay, dampening, nesterov, hasBuf);
         if (_capture != null) _capture.Add(() => _sgdStep(_stream, (int)p.Length, p.View, g.View, buf.View,
+            lr, momentum, weightDecay, dampening, nesterov, hasBuf));
+        AfterLaunch();
+    }
+
+    public override void LaunchAdamCapturable(
+        TensorStorage pS, TensorStorage gS, TensorStorage mS, TensorStorage vS,
+        float b1, float oneMinusB1, float b2, float oneMinusB2,
+        TensorStorage lrBufS, float eps, TensorStorage advS,
+        float coupledWd, float decoupledWd)
+    {
+        var p = B(pS); var g = B(gS); var m = B(mS); var v = B(vS);
+        var lr = B(lrBufS).View;                      // length-1; kernel reads lr[0] per replay
+        var bc = B(advS).View.SubView(1, 2);          // [invBc1, invBc2]
+        _adamStepCapturable(_stream, (int)p.Length, p.View, g.View, m.View, v.View,
+            b1, oneMinusB1, b2, oneMinusB2, lr, eps, bc, coupledWd, decoupledWd);
+        if (_capture != null) _capture.Add(() => _adamStepCapturable(_stream, (int)p.Length, p.View, g.View, m.View, v.View,
+            b1, oneMinusB1, b2, oneMinusB2, lr, eps, bc, coupledWd, decoupledWd));
+        AfterLaunch();
+    }
+
+    public override void LaunchSgdCapturable(
+        TensorStorage pS, TensorStorage gS, TensorStorage bufS,
+        TensorStorage lrBufS, float momentum, float weightDecay, float dampening, float nesterov, float hasBuf)
+    {
+        var p = B(pS); var g = B(gS); var buf = B(bufS);
+        var lr = B(lrBufS).View;                      // length-1; kernel reads lr[0] per replay
+        _sgdStepCapturable(_stream, (int)p.Length, p.View, g.View, buf.View,
+            lr, momentum, weightDecay, dampening, nesterov, hasBuf);
+        if (_capture != null) _capture.Add(() => _sgdStepCapturable(_stream, (int)p.Length, p.View, g.View, buf.View,
             lr, momentum, weightDecay, dampening, nesterov, hasBuf));
         AfterLaunch();
     }

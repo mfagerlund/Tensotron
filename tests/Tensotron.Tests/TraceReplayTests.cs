@@ -275,4 +275,70 @@ public class TraceReplayTests
             Assert.Equal(expLoss[t], graph.Output.Item(), 2);
         }
     }
+
+    // The capturable optimizer's whole point: the learning rate is read from a device scalar on every
+    // replay, so a captured full step (fwd→loss→bwd→opt.Step) honours an LR uploaded BETWEEN replays
+    // instead of freezing the capture-time rate. This is checked DETERMINISTICALLY via the lr=0
+    // invariant: with lr=0 the update term is exactly zero ((1−0·wd)·p − 0·… = p), so the params cannot
+    // move — independent of the (noisy, atomic-reduced) gradient the replayed backward produces. A
+    // frozen capture-time LR (the bug) WOULD move them, so an exact "unchanged" assertion is an
+    // unambiguous, noise-immune discriminator. The mirror assertions show a non-zero live LR actually
+    // moves params, so the test can't pass by the kernel simply doing nothing.
+    [Fact]
+    public void Captured_step_honours_live_learning_rate_per_replay()
+    {
+        const int batch = 8, inDim = 4, width = 8, outDim = 2;
+        var rng = new Random(13);
+        float[] Rand(int n) { var a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() - 0.5); return a; }
+        var x = Tensor.FromArray(Rand(batch * inDim), batch, inDim);
+        var t = Tensor.FromArray(Rand(batch * outDim), batch, outDim);
+
+        Init.Seed(5);
+        var m = new Sequential(new Linear(inDim, width), Activation.Tanh(), new Linear(width, outDim));
+        var ps = m.Parameters().ToList();
+        var opt = new Adam(ps, lr: 1e-2f, capturable: true);
+        Tensor Body()
+        {
+            opt.ZeroGrad();
+            var loss = TensorOps.MseLoss(m.Forward(x), t);
+            loss.Backward();
+            opt.Step();
+            return loss;
+        }
+
+        // Warmup eagerly so the optimizer's state (m, v, adv, and the LR scalar) is allocated before
+        // capture (the documented steady-state contract). Capture then EXECUTES the body once (a real
+        // non-zero-LR step); snapshot params AFTER capture as the reference point.
+        opt.LearningRate = 1e-2f;
+        { var l = Body(); l.DisposeGraph(); }
+        using var g = TensorRuntime.Instance.Capture(Body);
+        if (TensorRuntime.Instance.UsesCuBlas)
+            Assert.True(g.UsesNativeGraph, "expected the captured capturable step to fold into a native CUDA graph");
+        var p0 = ps[0].ToArray();
+
+        // Replay with LR uploaded as 0 → update term is exactly zero → params bit-unchanged.
+        opt.LearningRate = 0f;
+        g.Replay();
+        TensorRuntime.Instance.Sync();
+        var afterZero = ps[0].ToArray();
+        for (int i = 0; i < p0.Length; i++)
+            Assert.Equal(p0[i], afterZero[i]);   // exact: a frozen non-zero LR would have moved these
+
+        // Replay with a real LR uploaded → params must actually move (the live scalar drives work).
+        opt.LearningRate = 5e-2f;
+        g.Replay();
+        TensorRuntime.Instance.Sync();
+        var afterStep = ps[0].ToArray();
+        bool moved = false;
+        for (int i = 0; i < p0.Length; i++) if (MathF.Abs(afterStep[i] - p0[i]) > 1e-6f) { moved = true; break; }
+        Assert.True(moved, "a non-zero live LR must move params on replay");
+
+        // LR back to 0 from the new point → frozen again, proving each replay re-reads the scalar.
+        opt.LearningRate = 0f;
+        g.Replay();
+        TensorRuntime.Instance.Sync();
+        var afterZero2 = ps[0].ToArray();
+        for (int i = 0; i < afterStep.Length; i++)
+            Assert.Equal(afterStep[i], afterZero2[i]);
+    }
 }

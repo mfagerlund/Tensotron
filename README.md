@@ -33,11 +33,15 @@ For the reinforcement-learning demo — a PPO controller driving the corridor ab
 
 ![CPU inference latency: Tensotron SIMD vs PyTorch CPU](docs/img/cpu_inference.png)
 
-At training scale and on the GPU, Tensotron is in PyTorch's league — it ties or marginally beats PyTorch on FP32 GEMM (both call cuBLAS `Sgemm`), wins on small MLPs, and trails ~1.5–2× on conv and large MLPs (per-op host overhead plus cuDNN's fused conv kernels).
+At training scale and on the GPU, Tensotron is in PyTorch's league — it matches PyTorch on FP32 GEMM (both call cuBLAS `Sgemm`), is ~1.9× faster on a small-batch MLP step, roughly par on a large MLP, and trails ~2–3× on conv (per-op host overhead plus cuDNN's fused conv kernels). TF32 tensor cores — which Tensotron forgoes by being FP32-only — are the throughput ceiling on large GEMM, but don't help these overhead-bound small steps.
 
 ![GPU training step and FP32 GEMM throughput vs PyTorch](docs/img/gpu_training.png)
 
-Methodology, full tables, and the *why* are in [`docs/PERFORMANCE_VS_PYTORCH.md`](docs/PERFORMANCE_VS_PYTORCH.md). Reproduce the CPU figure with `dotnet run --project examples/Tensotron.Examples -c Release -- inference` (under `TENSOTRON_BACKEND=simd` then `=cuda`) plus `python tools/bench/torch_infer.py`; the GPU figure with `... -- ladder` plus `python tools/bench/torch_bench.py` on an unloaded GPU.
+For the small fixed-shape training steps that dominate small-net RL, capturing the step once and replaying it as a single native CUDA-graph launch erases nearly all the per-step host dispatch — **~6–8× per step** at the control-net / PPO scale where that overhead is the bottleneck (fwd + bwd + grad-clip + Adam, all folded into one `cuGraphLaunch`).
+
+![Step capture: eager vs native CUDA-graph replay](docs/img/capture_speedup.png)
+
+Methodology, full tables, and the *why* are in [`docs/PERFORMANCE_VS_PYTORCH.md`](docs/PERFORMANCE_VS_PYTORCH.md). Reproduce the CPU figure with `dotnet run --project examples/Tensotron.Examples -c Release -- inference` (under `TENSOTRON_BACKEND=simd` then `=cuda`) plus `python tools/bench/torch_infer.py`; the GPU figure with `... -- ladder` plus `python tools/bench/torch_bench.py` on an unloaded GPU; the capture figure with `... -- replay`.
 
 ## Backends
 

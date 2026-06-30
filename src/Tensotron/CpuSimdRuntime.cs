@@ -266,5 +266,26 @@ internal sealed class CpuSimdRuntime : TensorRuntime
         Launches++;
     }
 
+    // This backend has no capture/replay, so reading lr from the buffer here (host-side) is exact and
+    // numerically matches the GPU's AdamStepCapturable/SgdStepCapturable (which read lr[0] on-device).
+    public override void LaunchAdamCapturable(TensorStorage p, TensorStorage g, TensorStorage m, TensorStorage v,
+        float b1, float oneMinusB1, float b2, float oneMinusB2,
+        TensorStorage lrBufS, float eps, TensorStorage advS, float coupledWd, float decoupledWd)
+    {
+        float lr = H(lrBufS)[0];
+        var adv = H(advS);
+        CpuKernels.AdamStep(H(p), H(g), H(m), H(v),
+            b1, oneMinusB1, b2, oneMinusB2, lr, eps, adv[1], adv[2], coupledWd, 1f - lr * decoupledWd);
+        Launches++;
+    }
+
+    public override void LaunchSgdCapturable(TensorStorage p, TensorStorage g, TensorStorage buf,
+        TensorStorage lrBufS, float momentum, float weightDecay, float dampening, float nesterov, float hasBuf)
+    {
+        float lr = H(lrBufS)[0];
+        CpuKernels.SgdStep(H(p), H(g), H(buf), lr, momentum, weightDecay, dampening, nesterov, hasBuf);
+        Launches++;
+    }
+
     public override void Dispose() => _ctx?.Dispose();
 }

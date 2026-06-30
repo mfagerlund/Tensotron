@@ -144,6 +144,54 @@ internal static class Kernels
     }
 
     /// <summary>
+    /// <see cref="AdamStep"/> with the learning rate read from a length-1 device buffer
+    /// (<paramref name="lrBuf"/>) instead of a by-value argument, and the AdamW decoupled-decay
+    /// factor (1 − lr·wd) computed in-kernel from <paramref name="decoupledWd"/> rather than
+    /// host-precomputed. This is the "capturable" optimizer path: inside a captured graph an LR
+    /// passed by value is frozen at capture time, but a value read from a stable device buffer is
+    /// honoured by every replay (an <c>Upload</c> to <paramref name="lrBuf"/> between replays takes
+    /// effect — the same mechanism the minibatch input tensors use). <paramref name="decoupledWd"/>
+    /// is 0 for plain Adam (factor ⇒ 1) and the weight decay for AdamW.
+    /// </summary>
+    public static void AdamStepCapturable(
+        Index1D i,
+        ArrayView<float> p, ArrayView<float> g, ArrayView<float> m, ArrayView<float> v,
+        float b1, float oneMinusB1, float b2, float oneMinusB2,
+        ArrayView<float> lrBuf, float eps, ArrayView<float> bc,
+        float coupledWd, float decoupledWd)
+    {
+        float lr = lrBuf[0];
+        float invBc1 = bc[0], invBc2 = bc[1];
+        float pi = p[i];
+        float gi = g[i] + coupledWd * pi;            // coupled L2 (0 for AdamW)
+        float mi = b1 * m[i] + oneMinusB1 * gi;
+        float vi = b2 * v[i] + oneMinusB2 * gi * gi;
+        m[i] = mi;
+        v[i] = vi;
+        float step = (mi * invBc1) / (XMath.Sqrt(vi * invBc2) + eps);
+        float decoupledFactor = 1f - lr * decoupledWd;   // 1 when decoupledWd==0 (plain Adam)
+        p[i] = pi * decoupledFactor - lr * step;
+    }
+
+    /// <summary><see cref="SgdStep"/> with the learning rate read from a length-1 device buffer
+    /// (the capturable path — see <see cref="AdamStepCapturable"/>).</summary>
+    public static void SgdStepCapturable(
+        Index1D i,
+        ArrayView<float> p, ArrayView<float> g, ArrayView<float> buf,
+        ArrayView<float> lrBuf, float momentum, float weightDecay, float dampening, float nesterov, float hasBuf)
+    {
+        float lr = lrBuf[0];
+        float gi = g[i] + weightDecay * p[i];
+        if (momentum != 0f)
+        {
+            float b = hasBuf != 0f ? momentum * buf[i] + (1f - dampening) * gi : gi;
+            buf[i] = b;
+            gi = nesterov != 0f ? gi + momentum * b : b;
+        }
+        p[i] = p[i] - lr * gi;
+    }
+
+    /// <summary>
     /// General axis reduction (sum). One thread per OUTPUT element; it loops over
     /// the cartesian product of the reduced axes. Output dims have reduced axes = 1
     /// (keepdim). Correct for any axis set; not the fastest (no tree reduction) —

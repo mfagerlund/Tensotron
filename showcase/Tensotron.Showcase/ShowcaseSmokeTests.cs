@@ -46,6 +46,41 @@ public class ShowcaseSmokeTests
     }
 
     [Fact]
+    public void Ppo_ValueTargetNormalization_KeepsCriticBounded()
+    {
+        const int maxSteps = 150;
+        Init.Seed(2);
+        var rng = new Random(2);
+
+        var ac = new ActorCritic(stateSize: 4, actionSize: 1, hidden: 32);
+        var ppo = new ContinuousPpo(ac, () => new SinglePoleCart(rng, maxSteps), rng)
+        {
+            NumEnvs = 8, Horizon = 64, Epochs = 3, MinibatchSize = 256, LearningRate = 3e-3f,
+        };
+
+        float maxLoss = 0f;
+        int totalSkipped = 0;
+        ppo.Train(20, (i, ret) =>
+        {
+            if (float.IsFinite(ppo.LastLoss)) maxLoss = MathF.Max(maxLoss, ppo.LastLoss);
+            totalSkipped += ppo.LastSkippedUpdates;
+            if (i % 5 == 0)
+                _out.WriteLine($"iter {i,2}: return={ret:0.0} loss={ppo.LastLoss:0.000} σ_ret={ppo.ReturnScale:0.00} skipped={ppo.LastSkippedUpdates}");
+        });
+
+        _out.WriteLine($"maxLoss={maxLoss:0.000}, ReturnScale={ppo.ReturnScale:0.00}, totalSkipped={totalSkipped}");
+
+        // The value head regresses onto ret/σ, so σ_ret calibrates to the real return scale (rewards are
+        // +1/step → RMS ≫ 1). Without this normalization σ stays exactly 1.0 and the raw-target MSE is
+        // free to random-walk into the 1e8 range; with it the (unit-scale) value targets keep the total
+        // loss O(1). Both assertions fail if the normalization is removed.
+        Assert.True(ppo.ReturnScale > 2f, $"return-scale normalization did not engage (σ_ret={ppo.ReturnScale}).");
+        Assert.True(maxLoss < 25f, $"value loss not bounded by normalization (maxLoss={maxLoss}).");
+        // A healthy run never trips the non-finite crash guard — a non-zero count means a minibatch went NaN.
+        Assert.Equal(0, totalSkipped);
+    }
+
+    [Fact]
     public void Cnn_LossDecreases_OnSyntheticImages()
     {
         Init.Seed(0);

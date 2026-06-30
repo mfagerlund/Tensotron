@@ -131,12 +131,27 @@ public static class BenchExample
     {
         Thread.CurrentThread.CurrentCulture = CultureInfo.InvariantCulture;
         var rt = TensorRuntime.Instance;
-        Console.WriteLine("== Trace replay vs eager (PPO-scale MLP train step) ==");
-        Console.WriteLine($"  device: {rt.DeviceName}");
+        Console.WriteLine("== Trace replay vs eager (MLP train step: fwd+bwd+clip+Adam) ==");
+        Console.WriteLine($"  device: {rt.DeviceName}  cudaGraph={rt.EnableCudaGraph}");
 
+        // Sweep from a tiny launch-bound control net (where killing per-step host dispatch wins
+        // biggest) up to a wider net (where real device work dilutes the speedup). Each config
+        // emits a RESULT line parsed by tools/bench/plot_perf.py for the capture-speedup figure.
+        foreach (var (name, batch, inDim, width, outDim) in new[]
+        {
+            ("ctrl-net-b1", 1, 8, 64, 2),
+            ("ppo-b512", 512, 8, 64, 2),
+            ("mlp-b256", 256, 128, 256, 10),
+        })
+            ReplayOne(rt, name, batch, inDim, width, outDim);
+
+        Console.WriteLine();
+    }
+
+    private static void ReplayOne(TensorRuntime rt, string name, int batch, int inDim, int width, int outDim)
+    {
         Init.Seed(0);
         var rng = new Random(0);
-        const int batch = 512, inDim = 8, width = 64, outDim = 2;
         var data = new float[batch * inDim];
         for (int i = 0; i < data.Length; i++) data[i] = (float)(rng.NextDouble() - 0.5);
         var input = Tensor.FromArray(data, batch, inDim);
@@ -158,7 +173,6 @@ public static class BenchExample
             return loss;
         }
 
-        double toUs = 1e6 / Stopwatch.Frequency;
         const int warm = 100, iters = 1000;
         var sw = new Stopwatch();
 
@@ -171,8 +185,8 @@ public static class BenchExample
         sw.Stop();
         double eagerUs = sw.Elapsed.TotalMilliseconds * 1000.0 / iters;
 
-        // Capture once (advances opt past warmup so frozen Adam bias-correction ≈ 1), then replay.
-        var graph = rt.Capture(StepBody);
+        // Capture once (warmup advances opt so the frozen Adam bias-correction ≈ steady), then replay.
+        using var graph = rt.Capture(StepBody);
         for (int i = 0; i < warm; i++) graph.Replay();
         rt.Sync();
         sw.Restart();
@@ -181,11 +195,8 @@ public static class BenchExample
         sw.Stop();
         double replayUs = sw.Elapsed.TotalMilliseconds * 1000.0 / iters;
 
-        Console.WriteLine($"  {graph.LaunchCount} launches/step (replay re-fires these, no graph rebuild)");
-        Console.WriteLine($"  eager  : {eagerUs,8:0.0} us/step");
-        Console.WriteLine($"  replay : {replayUs,8:0.0} us/step");
-        Console.WriteLine($"  speedup: {eagerUs / replayUs,8:0.00}x");
-        Console.WriteLine();
+        Console.WriteLine($"  {name,-12} {graph.LaunchCount,3} launches | eager {eagerUs,8:0.0} | replay {replayUs,8:0.0} us | {eagerUs / replayUs,6:0.00}x | native={graph.UsesNativeGraph}");
+        Console.WriteLine($"RESULT replay config={name} batch={batch} eager_us={eagerUs:0.000} replay_us={replayUs:0.000} speedup={eagerUs / replayUs:0.000} launches={graph.LaunchCount} native={graph.UsesNativeGraph}");
     }
 
     /// <summary>

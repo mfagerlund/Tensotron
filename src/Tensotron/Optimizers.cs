@@ -10,7 +10,23 @@ namespace Tensotron;
 public abstract class Optimizer
 {
     protected readonly IReadOnlyList<Tensor> Parameters;
-    public float LearningRate { get; set; }
+
+    private float _learningRate;
+
+    /// <summary>The learning rate. For a <c>capturable</c> optimizer the setter also mirrors the new
+    /// value into a persistent device scalar (via <see cref="OnLearningRateChanged"/>), so changing it
+    /// between captured-graph replays — or stepping an <see cref="LrScheduler"/> — is honoured by the
+    /// next replay rather than frozen at capture time. See <see cref="Adam"/>.</summary>
+    public float LearningRate
+    {
+        get => _learningRate;
+        set { _learningRate = value; OnLearningRateChanged(value); }
+    }
+
+    /// <summary>Fired whenever <see cref="LearningRate"/> is set. Default no-op; a capturable optimizer
+    /// overrides it to upload the rate into its device scalar. (Called from the base constructor before
+    /// derived fields are initialized, so overrides must tolerate a not-yet-allocated buffer.)</summary>
+    protected virtual void OnLearningRateChanged(float lr) { }
 
     protected Optimizer(IReadOnlyList<Tensor> parameters, float lr)
     {
@@ -58,20 +74,30 @@ public sealed class Sgd : Optimizer
 {
     private readonly float _momentum, _weightDecay, _dampening;
     private readonly bool _nesterov;
+    private readonly bool _capturable;
+    private readonly Tensor? _lrDevice;
     private readonly Dictionary<Tensor, Tensor> _buf = new();
 
+    /// <param name="capturable">See <see cref="Adam(IReadOnlyList{Tensor}, float, float, float, float, float, bool)"/>:
+    /// reads the learning rate from a device scalar so the step can live in a captured graph.</param>
     public Sgd(IReadOnlyList<Tensor> parameters, float lr,
-        float momentum = 0f, float weightDecay = 0f, float dampening = 0f, bool nesterov = false)
+        float momentum = 0f, float weightDecay = 0f, float dampening = 0f, bool nesterov = false,
+        bool capturable = false)
         : base(parameters, lr)
     {
         _momentum = momentum;
         _weightDecay = weightDecay;
         _dampening = dampening;
         _nesterov = nesterov;
+        _capturable = capturable;
+        if (capturable) _lrDevice = Tensor.FromArray(new[] { lr }, 1);
     }
+
+    protected override void OnLearningRateChanged(float lr) => _lrDevice?.Upload(new[] { lr });
 
     public override void Step() => StepNoGrad(() =>
     {
+        var rt = TensorRuntime.Instance;
         foreach (var p in Parameters)
         {
             if (p.Grad == null) continue;
@@ -88,9 +114,14 @@ public sealed class Sgd : Optimizer
             }
             else { buf = p.Grad!; hasBuf = 0f; }
 
-            TensorRuntime.Instance.LaunchSgd(
-                p.Buffer, p.Grad!.Buffer, buf.Buffer,
-                LearningRate, _momentum, _weightDecay, _dampening, _nesterov ? 1f : 0f, hasBuf);
+            if (_capturable)
+                rt.LaunchSgdCapturable(
+                    p.Buffer, p.Grad!.Buffer, buf.Buffer,
+                    _lrDevice!.Buffer, _momentum, _weightDecay, _dampening, _nesterov ? 1f : 0f, hasBuf);
+            else
+                rt.LaunchSgd(
+                    p.Buffer, p.Grad!.Buffer, buf.Buffer,
+                    LearningRate, _momentum, _weightDecay, _dampening, _nesterov ? 1f : 0f, hasBuf);
         }
     });
 
@@ -113,14 +144,25 @@ public sealed class Sgd : Optimizer
 public sealed class Adam : Optimizer
 {
     private readonly float _b1, _b2, _eps, _weightDecay;
+    private readonly bool _capturable;
+    private readonly Tensor? _lrDevice;   // capturable: persistent [lr], the kernel reads it per replay
     private readonly Dictionary<Tensor, (Tensor m, Tensor v, Tensor adv)> _state = new();
 
+    /// <param name="capturable">When true, the fused step reads the learning rate from a device scalar
+    /// (torch's <c>capturable=True</c>): the whole <see cref="Step"/> can be folded into a captured
+    /// graph and the LR still varies across replays. Off by default — it adds a tiny per-step H2D copy
+    /// that the ungraphed path doesn't need.</param>
     public Adam(IReadOnlyList<Tensor> parameters, float lr = 1e-3f,
-        float beta1 = 0.9f, float beta2 = 0.999f, float eps = 1e-8f, float weightDecay = 0f)
+        float beta1 = 0.9f, float beta2 = 0.999f, float eps = 1e-8f, float weightDecay = 0f,
+        bool capturable = false)
         : base(parameters, lr)
     {
         _b1 = beta1; _b2 = beta2; _eps = eps; _weightDecay = weightDecay;
+        _capturable = capturable;
+        if (capturable) _lrDevice = Tensor.FromArray(new[] { lr }, 1);
     }
+
+    protected override void OnLearningRateChanged(float lr) => _lrDevice?.Upload(new[] { lr });
 
     public override void Step() => StepNoGrad(() =>
     {
@@ -137,10 +179,16 @@ public sealed class Adam : Optimizer
             _state[p] = s;
 
             rt.LaunchAdvanceAdam(s.adv.Buffer, _b1, _b2);
-            rt.LaunchAdam(
-                p.Buffer, p.Grad!.Buffer, s.m.Buffer, s.v.Buffer,
-                _b1, 1f - _b1, _b2, 1f - _b2, LearningRate, _eps, s.adv.Buffer,
-                coupledWd: _weightDecay, decoupledFactor: 1f);
+            if (_capturable)
+                rt.LaunchAdamCapturable(
+                    p.Buffer, p.Grad!.Buffer, s.m.Buffer, s.v.Buffer,
+                    _b1, 1f - _b1, _b2, 1f - _b2, _lrDevice!.Buffer, _eps, s.adv.Buffer,
+                    coupledWd: _weightDecay, decoupledWd: 0f);
+            else
+                rt.LaunchAdam(
+                    p.Buffer, p.Grad!.Buffer, s.m.Buffer, s.v.Buffer,
+                    _b1, 1f - _b1, _b2, 1f - _b2, LearningRate, _eps, s.adv.Buffer,
+                    coupledWd: _weightDecay, decoupledFactor: 1f);
         }
     });
 
@@ -188,14 +236,24 @@ public sealed class Adam : Optimizer
 public sealed class AdamW : Optimizer
 {
     private readonly float _b1, _b2, _eps, _weightDecay;
+    private readonly bool _capturable;
+    private readonly Tensor? _lrDevice;
     private readonly Dictionary<Tensor, (Tensor m, Tensor v, Tensor adv)> _state = new();
 
+    /// <param name="capturable">See <see cref="Adam(IReadOnlyList{Tensor}, float, float, float, float, float, bool)"/>.
+    /// In the capturable path the decoupled-decay factor 1 − lr·wd is recomputed on-device from the
+    /// live LR each step, so it tracks an annealed LR across replays.</param>
     public AdamW(IReadOnlyList<Tensor> parameters, float lr = 1e-3f,
-        float beta1 = 0.9f, float beta2 = 0.999f, float eps = 1e-8f, float weightDecay = 1e-2f)
+        float beta1 = 0.9f, float beta2 = 0.999f, float eps = 1e-8f, float weightDecay = 1e-2f,
+        bool capturable = false)
         : base(parameters, lr)
     {
         _b1 = beta1; _b2 = beta2; _eps = eps; _weightDecay = weightDecay;
+        _capturable = capturable;
+        if (capturable) _lrDevice = Tensor.FromArray(new[] { lr }, 1);
     }
+
+    protected override void OnLearningRateChanged(float lr) => _lrDevice?.Upload(new[] { lr });
 
     public override void Step() => StepNoGrad(() =>
     {
@@ -209,12 +267,21 @@ public sealed class AdamW : Optimizer
             _state[p] = s;
 
             // Decoupled decay p <- p·(1 − lr·wd) is folded into the fused kernel's factor.
-            float decoupled = _weightDecay != 0f ? 1f - LearningRate * _weightDecay : 1f;
             rt.LaunchAdvanceAdam(s.adv.Buffer, _b1, _b2);
-            rt.LaunchAdam(
-                p.Buffer, p.Grad!.Buffer, s.m.Buffer, s.v.Buffer,
-                _b1, 1f - _b1, _b2, 1f - _b2, LearningRate, _eps, s.adv.Buffer,
-                coupledWd: 0f, decoupledFactor: decoupled);
+            if (_capturable)
+                // decoupledWd carries wd; the kernel forms 1 − lr·wd from the live device LR.
+                rt.LaunchAdamCapturable(
+                    p.Buffer, p.Grad!.Buffer, s.m.Buffer, s.v.Buffer,
+                    _b1, 1f - _b1, _b2, 1f - _b2, _lrDevice!.Buffer, _eps, s.adv.Buffer,
+                    coupledWd: 0f, decoupledWd: _weightDecay);
+            else
+            {
+                float decoupled = _weightDecay != 0f ? 1f - LearningRate * _weightDecay : 1f;
+                rt.LaunchAdam(
+                    p.Buffer, p.Grad!.Buffer, s.m.Buffer, s.v.Buffer,
+                    _b1, 1f - _b1, _b2, 1f - _b2, LearningRate, _eps, s.adv.Buffer,
+                    coupledWd: 0f, decoupledFactor: decoupled);
+            }
         }
     });
 

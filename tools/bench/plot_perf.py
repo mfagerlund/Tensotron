@@ -27,6 +27,8 @@ TORCH_GPU = "#b5651d"
 BATCHES = [1, 8, 64]
 
 RESULT_RE = re.compile(r"config=(\S+)\s+batch=(\d+)\s+us=([\d.]+)")
+REPLAY_RE = re.compile(
+    r"RESULT replay config=(\S+).*?eager_us=([\d.]+)\s+replay_us=([\d.]+)\s+speedup=([\d.]+)")
 
 
 def parse(path):
@@ -43,6 +45,20 @@ def parse(path):
     except FileNotFoundError:
         pass
     return out
+
+
+def parse_replay(path):
+    """[(config, eager_us, replay_us, speedup)] from `RESULT replay ...` lines (BenchExample.ReplayBench)."""
+    rows = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                m = REPLAY_RE.search(line)
+                if m:
+                    rows.append((m.group(1), float(m.group(2)), float(m.group(3)), float(m.group(4))))
+    except FileNotFoundError:
+        pass
+    return rows
 
 
 def label_bars(ax, bars, fmt="{:.0f}"):
@@ -109,40 +125,95 @@ def cpu_inference(bench_dir, out_dir):
 
 
 def gpu_training(out_dir):
-    # Documented clean-RTX-4090 numbers (docs/PERFORMANCE_VS_PYTORCH.md). FP32 strict baseline.
+    # Clean RTX-4090 measurements on an unloaded GPU (median of 3 Tensotron `... -- ladder` runs / 2
+    # PyTorch `tools/bench/torch_bench.py` runs). TF32 off for FP32 rows; see docs/PERFORMANCE_VS_PYTORCH.md.
+    # TF32 is omitted from the training panel because it does NOT help these overhead-bound small steps
+    # (torch strict ≈ default); it only matters on the compute-bound GEMM, where it's shown as the ceiling.
     train_labels = ["MLP small\n(b256)", "MLP large\n(b1024)", "CNN\n(b64)", "CNN\n(b256)"]
-    tens = [1.22, 3.34, 4.79, 5.04]
-    torch_fp32 = [2.04, 2.04, 2.84, 2.66]
-    torch_tf32 = [1.47, 1.40, 1.92, 1.96]
+    tens = [0.71, 1.62, 3.56, 6.22]
+    torch_fp32 = [1.32, 1.37, 1.86, 1.89]
 
     gemm_sizes = ["1024³", "2048³", "4096³"]
-    g_tens = [41.7, 48.7, 48.7]
-    g_torch = [34.8, 42.5, 45.7]
+    g_tens = [41.6, 50.1, 53.2]
+    g_torch_fp32 = [42.2, 50.3, 53.0]
+    g_torch_tf32 = [64.5, 72.2, 80.3]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.2), gridspec_kw={"width_ratios": [1.5, 1]})
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.2), gridspec_kw={"width_ratios": [1.5, 1.05]})
 
+    # --- training step: Tensotron FP32 vs PyTorch FP32 ---
     x = range(len(train_labels))
-    w = 0.27
-    ax1.bar([i - w for i in x], tens, w, label="Tensotron (FP32)", color=TENS)
-    ax1.bar(list(x), torch_fp32, w, label="PyTorch (FP32)", color=TORCH)
-    ax1.bar([i + w for i in x], torch_tf32, w, label="PyTorch (TF32)", color="#f4a261")
+    w = 0.36
+    b1 = ax1.bar([i - w / 2 for i in x], tens, w, label="Tensotron (FP32)", color=TENS)
+    b2 = ax1.bar([i + w / 2 for i in x], torch_fp32, w, label="PyTorch (FP32)", color=TORCH)
     ax1.set_xticks(list(x)); ax1.set_xticklabels(train_labels, fontsize=9)
     ax1.set_ylabel("ms / training step  (lower is better)")
     ax1.set_title("GPU training step  (fwd + bwd + Adam)", fontsize=11)
-    ax1.legend(fontsize=8.5, framealpha=0.9)
+    label_bars(ax1, b1, "{:.2f}"); label_bars(ax1, b2, "{:.2f}")
+    ax1.set_ylim(top=max(max(tens), max(torch_fp32)) * 1.28)
+    for i in x:
+        r = torch_fp32[i] / tens[i]
+        txt = f"{r:.1f}× faster" if r >= 1 else f"{1 / r:.1f}× slower"
+        top = max(tens[i], torch_fp32[i])
+        ax1.annotate(txt, (i, top + 0.55), ha="center", fontsize=8, fontweight="bold",
+                     color=(TENS if r >= 1 else TORCH))
+    ax1.legend(fontsize=8.5, framealpha=0.9, loc="upper left")
 
-    bb = ax2.bar([i - 0.2 for i in range(3)], g_tens, 0.4, label="Tensotron FP32", color=TENS)
-    bb2 = ax2.bar([i + 0.2 for i in range(3)], g_torch, 0.4, label="PyTorch FP32", color=TORCH)
-    ax2.set_xticks(range(3)); ax2.set_xticklabels(gemm_sizes)
+    # --- FP32 GEMM: Tensotron ≈ PyTorch (both cuBLAS Sgemm); TF32 = the tensor-core ceiling we forgo ---
+    gx = range(3)
+    gw = 0.27
+    bb = ax2.bar([i - gw for i in gx], g_tens, gw, label="Tensotron FP32", color=TENS)
+    bb2 = ax2.bar(list(gx), g_torch_fp32, gw, label="PyTorch FP32", color=TORCH)
+    bb3 = ax2.bar([i + gw for i in gx], g_torch_tf32, gw, label="PyTorch TF32", color="#f4a261")
+    ax2.set_xticks(list(gx)); ax2.set_xticklabels(gemm_sizes)
     ax2.set_ylabel("TFLOP/s  (higher is better)")
-    ax2.set_title("FP32 GEMM throughput\n(both call cuBLAS Sgemm)", fontsize=11)
-    ax2.legend(fontsize=8.5, framealpha=0.9)
-    label_bars(ax2, bb, "{:.0f}"); label_bars(ax2, bb2, "{:.0f}")
+    ax2.set_title("FP32 GEMM throughput\n(TF32 = the ceiling FP32-only forgoes)", fontsize=11)
+    ax2.legend(fontsize=8, framealpha=0.9, loc="upper left")
+    label_bars(ax2, bb, "{:.0f}"); label_bars(ax2, bb2, "{:.0f}"); label_bars(ax2, bb3, "{:.0f}")
+    ax2.set_ylim(top=max(g_torch_tf32) * 1.22)
 
-    fig.suptitle("On the GPU, Tensotron is in PyTorch's league: even on FP32 GEMM, ahead on small MLPs, "
-                 "~1.5–2× behind on conv  (RTX 4090)", fontsize=11.5, fontweight="bold", y=1.02)
+    fig.suptitle("On the GPU, Tensotron is in PyTorch's league: faster on small-batch MLP steps, ~par on "
+                 "FP32 GEMM, ~2–3× behind on small conv  (RTX 4090)", fontsize=11.5, fontweight="bold", y=1.02)
     fig.tight_layout()
     p = f"{out_dir}/gpu_training.png"
+    fig.savefig(p, dpi=130, bbox_inches="tight")
+    print("wrote", p)
+    plt.close(fig)
+
+
+def capture_speedup(bench_dir, out_dir):
+    """eager vs native-CUDA-graph replay per training-step config (from RESULT replay lines)."""
+    rows = parse_replay(f"{bench_dir}/replay.txt")
+    if not rows:
+        print("no replay data in", f"{bench_dir}/replay.txt", "- skipping capture_speedup")
+        return
+    names = [r[0] for r in rows]
+    eager = [r[1] for r in rows]
+    replay = [r[2] for r in rows]
+    speed = [r[3] for r in rows]
+
+    fig, ax = plt.subplots(figsize=(8, 4.4))
+    x = range(len(names))
+    w = 0.38
+    b1 = ax.bar([i - w / 2 for i in x], eager, w, label="eager (rebuild autograd graph each step)", color=TORCH)
+    b2 = ax.bar([i + w / 2 for i in x], replay, w, label="capture + replay (one cuGraphLaunch)", color=TENS)
+    ax.set_yscale("log")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(names)
+    ax.set_ylabel("microseconds / training step  (log, lower is better)")
+    ax.set_title("Step capture: eager vs native CUDA-graph replay  (fwd + bwd + clip + Adam)", fontsize=11)
+    label_bars(ax, b1); label_bars(ax, b2)
+    for i in x:
+        top = max(eager[i], replay[i])
+        ax.annotate(f"{speed[i]:.1f}× faster", (i, top * 1.45), ha="center", fontsize=9.5,
+                    fontweight="bold", color=TENS)
+    ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
+    ax.set_ylim(top=ax.get_ylim()[1] * 2.4)
+    ax.margins(x=0.08)
+
+    fig.suptitle("A fixed-shape training step replays as a single CUDA-graph launch — host dispatch erased",
+                 fontsize=12, fontweight="bold", y=1.0)
+    fig.tight_layout()
+    p = f"{out_dir}/capture_speedup.png"
     fig.savefig(p, dpi=130, bbox_inches="tight")
     print("wrote", p)
     plt.close(fig)
@@ -151,5 +222,10 @@ def gpu_training(out_dir):
 if __name__ == "__main__":
     bench_dir = sys.argv[1] if len(sys.argv) > 1 else "."
     out_dir = sys.argv[2] if len(sys.argv) > 2 else "docs/img"
-    cpu_inference(bench_dir, out_dir)
-    gpu_training(out_dir)
+    which = sys.argv[3] if len(sys.argv) > 3 else "all"
+    if which in ("all", "cpu"):
+        cpu_inference(bench_dir, out_dir)
+    if which in ("all", "gpu"):
+        gpu_training(out_dir)
+    if which in ("all", "capture"):
+        capture_speedup(bench_dir, out_dir)
