@@ -9,3 +9,6 @@ __pycache__/
 # Example/showcase render outputs written to the working dir
 /spiral.svg
 /regression.svg
+
+# Throwaway working files (probes, review notes, sample scratch projects)
+/scratch/
