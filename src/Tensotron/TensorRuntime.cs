@@ -171,7 +171,13 @@ public abstract class TensorRuntime : IDisposable
 
     /// <summary>Record a fixed-shape step and return a graph that replays its device launches with
     /// no host-side graph rebuild. Only the ILGPU backend amortizes per-launch overhead this way;
-    /// the managed CPU backend has no launch to amortize and does not support it.</summary>
+    /// the managed CPU backend has no launch to amortize and does not support it.
+    ///
+    /// Capture the body in STEADY STATE: every persistent buffer it touches (optimizer moments m/v,
+    /// the Adam step state, any lazily-built parameter) must already be allocated before capture, so
+    /// the recorded step does not contain one-time zero-init that would re-run — and corrupt — on
+    /// every replay. Run at least one eager warmup step first (the same requirement as PyTorch's CUDA
+    /// graphs). Per-step grad zeroing is fine; it is meant to re-run each replay.</summary>
     public virtual CapturedGraph Capture(Func<Tensor> body) =>
         throw new NotSupportedException($"{GetType().Name} does not support trace capture.");
 
@@ -234,7 +240,11 @@ public abstract class TensorRuntime : IDisposable
     public abstract void LaunchAvgPool2dGrad(TensorStorage g, TensorStorage gx, int[] cfg);
     public abstract void LaunchAdam(TensorStorage p, TensorStorage g, TensorStorage m, TensorStorage v,
         float b1, float oneMinusB1, float b2, float oneMinusB2,
-        float lr, float eps, float invBc1, float invBc2, float coupledWd, float decoupledFactor);
+        float lr, float eps, TensorStorage adv, float coupledWd, float decoupledFactor);
+    /// <summary>Advance a parameter's device-resident Adam state <c>adv</c> = [t, invBc1, invBc2]
+    /// (increment t, recompute bias corrections). Call once per param per step before
+    /// <see cref="LaunchAdam"/>; a captured graph replays it so bias correction stays correct.</summary>
+    public abstract void LaunchAdvanceAdam(TensorStorage adv, float b1, float b2);
     public abstract void LaunchSgd(TensorStorage p, TensorStorage g, TensorStorage buf,
         float lr, float momentum, float weightDecay, float dampening, float nesterov, float hasBuf);
 
@@ -319,7 +329,8 @@ internal sealed class IlgpuRuntime : TensorRuntime
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<int>> _avgPool2d;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<int>> _avgPool2dGrad;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>,
-        float, float, float, float, float, float, float, float, float, float> _adamStep;
+        float, float, float, float, float, float, ArrayView<float>, float, float> _adamStep;
+    private readonly Action<Index1D, ArrayView<float>, float, float> _advanceAdam;
     private readonly Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
         float, float, float, float, float, float> _sgdStep;
 
@@ -410,7 +421,9 @@ internal sealed class IlgpuRuntime : TensorRuntime
 
         _adamStep = Accelerator.LoadAutoGroupedStreamKernel<
             Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>, ArrayView<float>,
-            float, float, float, float, float, float, float, float, float, float>(Kernels.AdamStep);
+            float, float, float, float, float, float, ArrayView<float>, float, float>(Kernels.AdamStep);
+        _advanceAdam = Accelerator.LoadAutoGroupedStreamKernel<
+            Index1D, ArrayView<float>, float, float>(Kernels.AdvanceAdam);
         _sgdStep = Accelerator.LoadAutoGroupedStreamKernel<
             Index1D, ArrayView<float>, ArrayView<float>, ArrayView<float>,
             float, float, float, float, float, float>(Kernels.SgdStep);
@@ -462,7 +475,7 @@ internal sealed class IlgpuRuntime : TensorRuntime
             Allocs++;
             buf = Accelerator.Allocate1D<float>(length);
         }
-        if (_capture != null) (_pinned ??= new()).Add(buf);  // pin trace memory against pool reuse
+        if (_capture != null) { (_pinned ??= new()).Add(buf); _capturePins!.Add(buf); }  // pin trace memory against pool reuse
         return new DeviceStorage(buf);
     }
 
@@ -502,13 +515,16 @@ internal sealed class IlgpuRuntime : TensorRuntime
     private List<Action>? _capture;   // non-null while capturing: each launch appends a replay thunk
     private int _captureExpected;     // launches seen during capture; must equal _capture.Count
     private HashSet<MemoryBuffer1D<float, Stride1D.Dense>>? _pinned;  // trace-owned; pool must not recycle
+    private List<MemoryBuffer1D<float, Stride1D.Dense>>? _capturePins; // this capture's pinned buffers
 
     public override CapturedGraph Capture(Func<Tensor> body)
     {
         if (_capture != null) throw new InvalidOperationException("Nested trace capture is not supported.");
         Sync();                                  // drain prior work so the trace starts clean
         var thunks = new List<Action>();
+        var pins = new List<MemoryBuffer1D<float, Stride1D.Dense>>();
         _capture = thunks;
+        _capturePins = pins;
         _captureExpected = 0;
         Tensor output;
         try
@@ -520,9 +536,22 @@ internal sealed class IlgpuRuntime : TensorRuntime
             // Always clear the capture flag — an un-tapped op (or any error) in the body must not
             // leave the runtime stuck in capture mode for every subsequent call.
             _capture = null;
+            _capturePins = null;
         }
         Sync();                                  // finish the capture step's device work
-        return new CapturedGraph(this, thunks, output);
+        // Reclamation: the graph's pinned buffers stay un-recyclable for its lifetime; disposing the
+        // graph un-pins them so their owning tensors can return them to the pool normally. Without
+        // this, _pinned grew forever across captures (a leak when many graphs are captured).
+        return new CapturedGraph(this, thunks, output, () => Unpin(pins));
+    }
+
+    // Release a captured graph's buffers from the pin set (called on CapturedGraph.Dispose). They are
+    // not force-freed — their owning tensors recycle them via the normal Dispose path — but they stop
+    // blocking pool reuse, so re-capturing or steady-state training doesn't accumulate dead pins.
+    private void Unpin(List<MemoryBuffer1D<float, Stride1D.Dense>> pins)
+    {
+        if (_pinned == null) return;
+        foreach (var b in pins) _pinned.Remove(b);
     }
 
     // Read-only shape/stride/config int buffers recur IDENTICALLY every step (the model's
@@ -556,8 +585,10 @@ internal sealed class IlgpuRuntime : TensorRuntime
         Launches++;
         if (_capture != null && _capture.Count != ++_captureExpected)
             throw new InvalidOperationException(
-                $"Trace capture: '{caller}' issued a kernel without recording a replay thunk — " +
-                "this op is not trace/replay-supported yet.");
+                $"Trace capture: '{caller}' issued a kernel without recording a replay thunk — this op " +
+                "is not trace/replay-supported. Data-dependent index ops (gather, scatter-add, maxpool " +
+                "argmax) cannot be replayed because their indices vary per step; keep them outside the " +
+                "captured body.");
         if (++_opsSinceSync >= _flushEvery) Drain();
     }
 
@@ -754,6 +785,8 @@ internal sealed class IlgpuRuntime : TensorRuntime
         var dMask = AllocInt(reduceMask);
         _reduceArg((int)outIdx.Length, inDims.Length, inp.View, outIdx.View,
             dInDims.View, dInStrides.View, dOutDims.View, dMask.View, isMax ? 1 : 0);
+        if (_capture != null) _capture.Add(() => _reduceArg((int)outIdx.Length, inDims.Length,
+            inp.View, outIdx.View, dInDims.View, dInStrides.View, dOutDims.View, dMask.View, isMax ? 1 : 0));
         AfterLaunch();
     }
 
@@ -817,6 +850,8 @@ internal sealed class IlgpuRuntime : TensorRuntime
         var dMask = AllocInt(reduceMask);
         _reduceArgGrad((int)gout.Length, inDims.Length, inp.View, gout.View, gx.View,
             dInDims.View, dInStrides.View, dOutDims.View, dMask.View, isMax ? 1 : 0);
+        if (_capture != null) _capture.Add(() => _reduceArgGrad((int)gout.Length, inDims.Length,
+            inp.View, gout.View, gx.View, dInDims.View, dInStrides.View, dOutDims.View, dMask.View, isMax ? 1 : 0));
         AfterLaunch();
     }
 
@@ -831,6 +866,8 @@ internal sealed class IlgpuRuntime : TensorRuntime
         var dMask = AllocInt(reduceMask);
         _prodGrad((int)inp.Length, inDims.Length, inp.View, gout.View, gx.View,
             dInDims.View, dInStrides.View, dOutStrides.View, dMask.View);
+        if (_capture != null) _capture.Add(() => _prodGrad((int)inp.Length, inDims.Length,
+            inp.View, gout.View, gx.View, dInDims.View, dInStrides.View, dOutStrides.View, dMask.View));
         AfterLaunch();
     }
 
@@ -856,6 +893,8 @@ internal sealed class IlgpuRuntime : TensorRuntime
         var dDst = AllocInt(dstStrides);
         _scatterAxisRange((int)src.Length, srcDims.Length, src.View, dst.View,
             dSrc.View, dDst.View, axis, axisOffset);
+        if (_capture != null) _capture.Add(() => _scatterAxisRange((int)src.Length, srcDims.Length,
+            src.View, dst.View, dSrc.View, dDst.View, axis, axisOffset));
         AfterLaunch();
     }
 
@@ -874,27 +913,33 @@ internal sealed class IlgpuRuntime : TensorRuntime
     {
         var a = B(aS); var b = B(bS); var c = B(cS);
         // Compute-bound batched products: cuBLAS once per matrix. ILGPU's CuBlas (1.5.3) exposes no
-        // strided-batched entry point, so we loop plain SGEMM over the broadcast batch index.
+        // strided-batched entry point, so we loop plain SGEMM over the broadcast batch index. The
+        // whole deterministic loop replays as one recorded thunk (fixed offsets/shapes every step).
         if (_blas != null && (long)M * N * K >= CuBlasBatchedMinWork)
         {
-            int rank = batchDims.Length;
-            var idx = new int[rank];
-            for (int e = 0; e < batchCount; e++)
+            void RunBatched()
             {
-                long aOff = 0, bOff = 0;
-                for (int j = 0; j < rank; j++)
+                int rank = batchDims.Length;
+                var idx = new int[rank];
+                for (int e = 0; e < batchCount; e++)
                 {
-                    aOff += (long)idx[j] * aBatchStrides[j];
-                    bOff += (long)idx[j] * bBatchStrides[j];
+                    long aOff = 0, bOff = 0;
+                    for (int j = 0; j < rank; j++)
+                    {
+                        aOff += (long)idx[j] * aBatchStrides[j];
+                        bOff += (long)idx[j] * bBatchStrides[j];
+                    }
+                    long cOff = (long)e * M * N;
+                    CuBlasGemm(
+                        a.View.SubView(aOff, (long)M * K),
+                        b.View.SubView(bOff, (long)K * N),
+                        c.View.SubView(cOff, (long)M * N),
+                        M, N, K, aMs, aKs, bKs, bNs);
+                    for (int j = rank - 1; j >= 0; j--) { if (++idx[j] < batchDims[j]) break; idx[j] = 0; }
                 }
-                long cOff = (long)e * M * N;
-                CuBlasGemm(
-                    a.View.SubView(aOff, (long)M * K),
-                    b.View.SubView(bOff, (long)K * N),
-                    c.View.SubView(cOff, (long)M * N),
-                    M, N, K, aMs, aKs, bKs, bNs);
-                for (int j = rank - 1; j >= 0; j--) { if (++idx[j] < batchDims[j]) break; idx[j] = 0; }
             }
+            RunBatched();
+            if (_capture != null) _capture.Add(RunBatched);
             AfterLaunch();
             return;
         }
@@ -905,6 +950,8 @@ internal sealed class IlgpuRuntime : TensorRuntime
         _matmulBatched(batchCount * M * N, a.View, b.View, c.View,
             batchDims.Length, M, N, K, aMs, aKs, bKs, bNs,
             dBd.View, dAbs.View, dBbs.View);
+        if (_capture != null) _capture.Add(() => _matmulBatched(batchCount * M * N, a.View, b.View, c.View,
+            batchDims.Length, M, N, K, aMs, aKs, bKs, bNs, dBd.View, dAbs.View, dBbs.View));
         AfterLaunch();
     }
 
@@ -947,6 +994,8 @@ internal sealed class IlgpuRuntime : TensorRuntime
         var dInS = AllocInt(inStrides);
         _repeat((int)outp.Length, outDims.Length, x.View, outp.View,
             dOut.View, dInD.View, dInS.View);
+        if (_capture != null) _capture.Add(() => _repeat((int)outp.Length, outDims.Length,
+            x.View, outp.View, dOut.View, dInD.View, dInS.View));
         AfterLaunch();
     }
 
@@ -960,6 +1009,8 @@ internal sealed class IlgpuRuntime : TensorRuntime
         var dInS = AllocInt(inStrides);
         _repeatGrad((int)g.Length, outDims.Length, g.View, gx.View,
             dOut.View, dInD.View, dInS.View);
+        if (_capture != null) _capture.Add(() => _repeatGrad((int)g.Length, outDims.Length,
+            g.View, gx.View, dOut.View, dInD.View, dInS.View));
         AfterLaunch();
     }
 
@@ -968,6 +1019,7 @@ internal sealed class IlgpuRuntime : TensorRuntime
         var x = B(xS); var col = B(colS);
         var dCfg = AllocInt(cfg);
         _im2col((int)col.Length, x.View, col.View, dCfg.View);
+        if (_capture != null) _capture.Add(() => _im2col((int)col.Length, x.View, col.View, dCfg.View));
         AfterLaunch();
     }
 
@@ -976,6 +1028,7 @@ internal sealed class IlgpuRuntime : TensorRuntime
         var gcol = B(gcolS); var gx = B(gxS);
         var dCfg = AllocInt(cfg);
         _col2im((int)gcol.Length, gcol.View, gx.View, dCfg.View);
+        if (_capture != null) _capture.Add(() => _col2im((int)gcol.Length, gcol.View, gx.View, dCfg.View));
         AfterLaunch();
     }
 
@@ -1010,6 +1063,7 @@ internal sealed class IlgpuRuntime : TensorRuntime
         var x = B(xS); var outp = B(outpS);
         var dCfg = AllocInt(cfg);
         _avgPool2d((int)outp.Length, x.View, outp.View, dCfg.View);
+        if (_capture != null) _capture.Add(() => _avgPool2d((int)outp.Length, x.View, outp.View, dCfg.View));
         AfterLaunch();
     }
 
@@ -1018,21 +1072,33 @@ internal sealed class IlgpuRuntime : TensorRuntime
         var g = B(gS); var gx = B(gxS);
         var dCfg = AllocInt(cfg);
         _avgPool2dGrad((int)g.Length, g.View, gx.View, dCfg.View);
+        if (_capture != null) _capture.Add(() => _avgPool2dGrad((int)g.Length, g.View, gx.View, dCfg.View));
         AfterLaunch();
     }
 
-    /// <summary>Fused Adam/AdamW update (in place). See <see cref="Kernels.AdamStep"/>.</summary>
+    /// <summary>Advance a parameter's device-resident Adam state (see <see cref="Kernels.AdvanceAdam"/>).</summary>
+    public override void LaunchAdvanceAdam(TensorStorage advS, float b1, float b2)
+    {
+        var adv = B(advS);
+        _advanceAdam(1, adv.View, b1, b2);
+        if (_capture != null) _capture.Add(() => _advanceAdam(1, adv.View, b1, b2));
+        AfterLaunch();
+    }
+
+    /// <summary>Fused Adam/AdamW update (in place). See <see cref="Kernels.AdamStep"/>. Bias
+    /// corrections are read from <paramref name="advS"/>[1..3] (written by <see cref="LaunchAdvanceAdam"/>).</summary>
     public override void LaunchAdam(
         TensorStorage pS, TensorStorage gS, TensorStorage mS, TensorStorage vS,
         float b1, float oneMinusB1, float b2, float oneMinusB2,
-        float lr, float eps, float invBc1, float invBc2,
+        float lr, float eps, TensorStorage advS,
         float coupledWd, float decoupledFactor)
     {
         var p = B(pS); var g = B(gS); var m = B(mS); var v = B(vS);
+        var bc = B(advS).View.SubView(1, 2);          // [invBc1, invBc2]
         _adamStep((int)p.Length, p.View, g.View, m.View, v.View,
-            b1, oneMinusB1, b2, oneMinusB2, lr, eps, invBc1, invBc2, coupledWd, decoupledFactor);
+            b1, oneMinusB1, b2, oneMinusB2, lr, eps, bc, coupledWd, decoupledFactor);
         if (_capture != null) _capture.Add(() => _adamStep((int)p.Length, p.View, g.View, m.View, v.View,
-            b1, oneMinusB1, b2, oneMinusB2, lr, eps, invBc1, invBc2, coupledWd, decoupledFactor));
+            b1, oneMinusB1, b2, oneMinusB2, lr, eps, bc, coupledWd, decoupledFactor));
         AfterLaunch();
     }
 
@@ -1044,6 +1110,8 @@ internal sealed class IlgpuRuntime : TensorRuntime
         var p = B(pS); var g = B(gS); var buf = B(bufS);
         _sgdStep((int)p.Length, p.View, g.View, buf.View,
             lr, momentum, weightDecay, dampening, nesterov, hasBuf);
+        if (_capture != null) _capture.Add(() => _sgdStep((int)p.Length, p.View, g.View, buf.View,
+            lr, momentum, weightDecay, dampening, nesterov, hasBuf));
         AfterLaunch();
     }
 

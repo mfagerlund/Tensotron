@@ -82,18 +82,22 @@ internal static class Kernels
 
     /// <summary>
     /// Fused Adam / AdamW parameter update — one launch per parameter, fully in place, no
-    /// intermediate buffers or scalar uploads. Mutates m, v, p; reads g. Serves both variants:
+    /// intermediate buffers. Mutates m, v, p; reads g. Serves both variants:
     ///   Adam : coupledWd = weight_decay,           decoupledFactor = 1
     ///   AdamW: coupledWd = 0,                       decoupledFactor = 1 − lr·weight_decay
-    /// Bias corrections are folded into invBc1 = 1/(1−β1ᵗ), invBc2 = 1/(1−β2ᵗ) host-side.
+    /// Bias corrections are read from device memory (<paramref name="bc"/>[0]=1/(1−β1ᵗ),
+    /// [1]=1/(1−β2ᵗ)), written each step by <see cref="AdvanceAdam"/> from a device-resident step
+    /// counter — so a captured/replayed step advances them with no host work (frozen scalars would
+    /// distort the effective LR over a long replay).
     /// </summary>
     public static void AdamStep(
         Index1D i,
         ArrayView<float> p, ArrayView<float> g, ArrayView<float> m, ArrayView<float> v,
         float b1, float oneMinusB1, float b2, float oneMinusB2,
-        float lr, float eps, float invBc1, float invBc2,
+        float lr, float eps, ArrayView<float> bc,
         float coupledWd, float decoupledFactor)
     {
+        float invBc1 = bc[0], invBc2 = bc[1];
         float pi = p[i];
         float gi = g[i] + coupledWd * pi;            // coupled L2 (0 for AdamW)
         float mi = b1 * m[i] + oneMinusB1 * gi;
@@ -102,6 +106,21 @@ internal static class Kernels
         v[i] = vi;
         float step = (mi * invBc1) / (XMath.Sqrt(vi * invBc2) + eps);
         p[i] = pi * decoupledFactor - lr * step;     // decoupled decay folded into the factor
+    }
+
+    /// <summary>
+    /// Advance the device-resident Adam step counter and recompute its bias corrections, in place.
+    /// <paramref name="adv"/> = [t, invBc1, invBc2]: t increments, then invBc1=1/(1−β1ᵗ),
+    /// invBc2=1/(1−β2ᵗ). One thread (launch range 1). Run once per parameter per step, before
+    /// <see cref="AdamStep"/> reads <c>adv[1..3]</c>; replayed in a captured graph it re-advances t
+    /// on-device, so bias correction stays correct across replays.
+    /// </summary>
+    public static void AdvanceAdam(Index1D i, ArrayView<float> adv, float b1, float b2)
+    {
+        float t = adv[0] + 1f;
+        adv[0] = t;
+        adv[1] = 1f / (1f - XMath.Pow(b1, t));
+        adv[2] = 1f / (1f - XMath.Pow(b2, t));
     }
 
     /// <summary>

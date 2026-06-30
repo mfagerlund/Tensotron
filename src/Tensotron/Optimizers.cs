@@ -113,7 +113,7 @@ public sealed class Sgd : Optimizer
 public sealed class Adam : Optimizer
 {
     private readonly float _b1, _b2, _eps, _weightDecay;
-    private readonly Dictionary<Tensor, (Tensor m, Tensor v, int t)> _state = new();
+    private readonly Dictionary<Tensor, (Tensor m, Tensor v, Tensor adv)> _state = new();
 
     public Adam(IReadOnlyList<Tensor> parameters, float lr = 1e-3f,
         float beta1 = 0.9f, float beta2 = 0.999f, float eps = 1e-8f, float weightDecay = 0f)
@@ -124,51 +124,63 @@ public sealed class Adam : Optimizer
 
     public override void Step() => StepNoGrad(() =>
     {
+        var rt = TensorRuntime.Instance;
         foreach (var p in Parameters)
         {
             if (p.Grad == null) continue;
 
-            // State (m, v) is allocated once and updated IN PLACE by the fused kernel — no
-            // per-step intermediate tensors or scalar uploads.
+            // State (m, v) and the step/bias-correction triple adv=[t, invBc1, invBc2] are allocated
+            // once and updated IN PLACE on the device — no per-step intermediate tensors or host
+            // scalar uploads, so a captured step replays with the bias correction advancing on-device.
             if (!_state.TryGetValue(p, out var s))
-                s = (Tensor.Zeros(p.Shape), Tensor.Zeros(p.Shape), 0);
-            int t = s.t + 1;
-            _state[p] = (s.m, s.v, t);
+                s = (Tensor.Zeros(p.Shape), Tensor.Zeros(p.Shape), NewAdvState());
+            _state[p] = s;
 
-            float invBc1 = 1f / (1f - MathF.Pow(_b1, t));
-            float invBc2 = 1f / (1f - MathF.Pow(_b2, t));
-            TensorRuntime.Instance.LaunchAdam(
+            rt.LaunchAdvanceAdam(s.adv.Buffer, _b1, _b2);
+            rt.LaunchAdam(
                 p.Buffer, p.Grad!.Buffer, s.m.Buffer, s.v.Buffer,
-                _b1, 1f - _b1, _b2, 1f - _b2, LearningRate, _eps, invBc1, invBc2,
+                _b1, 1f - _b1, _b2, 1f - _b2, LearningRate, _eps, s.adv.Buffer,
                 coupledWd: _weightDecay, decoupledFactor: 1f);
         }
     });
 
-    public override IEnumerable<(string, Tensor)> StateDict() => AdamState(_state, Parameters);
-    public override void LoadStateDict(IReadOnlyDictionary<string, Tensor> state) => LoadAdamState(_state, Parameters, state);
+    // The device-resident Adam step state: [t=0, invBc1, invBc2]; LaunchAdvanceAdam fills the
+    // bias corrections on the first step (t→1). Held for the optimizer's life, like m/v.
+    internal static Tensor NewAdvState() => Tensor.FromArray(new[] { 0f, 0f, 0f }, 3);
 
-    // Shared (m, v, step) serialization for Adam/AdamW.
+    public override IEnumerable<(string, Tensor)> StateDict() => AdamState(_state, Parameters);
+    public override void LoadStateDict(IReadOnlyDictionary<string, Tensor> state) => LoadAdamState(_state, Parameters, state, _b1, _b2);
+
+    // Shared (m, v, step) serialization for Adam/AdamW. The step count lives in adv[0] on the device;
+    // it is pulled to host only here (checkpointing), not in the hot step.
     internal static IEnumerable<(string, Tensor)> AdamState(
-        Dictionary<Tensor, (Tensor m, Tensor v, int t)> st, IReadOnlyList<Tensor> ps)
+        Dictionary<Tensor, (Tensor m, Tensor v, Tensor adv)> st, IReadOnlyList<Tensor> ps)
     {
         for (int i = 0; i < ps.Count; i++)
             if (st.TryGetValue(ps[i], out var s))
             {
                 yield return ($"{i}.m", s.m);
                 yield return ($"{i}.v", s.v);
-                yield return ($"{i}.step", Scalar1(s.t));
+                yield return ($"{i}.step", Scalar1(s.adv.ToArray()[0]));
             }
     }
 
     internal static void LoadAdamState(
-        Dictionary<Tensor, (Tensor m, Tensor v, int t)> st, IReadOnlyList<Tensor> ps,
-        IReadOnlyDictionary<string, Tensor> state)
+        Dictionary<Tensor, (Tensor m, Tensor v, Tensor adv)> st, IReadOnlyList<Tensor> ps,
+        IReadOnlyDictionary<string, Tensor> state, float b1, float b2)
     {
         for (int i = 0; i < ps.Count; i++)
             if (state.TryGetValue($"{i}.m", out var m) &&
                 state.TryGetValue($"{i}.v", out var v) &&
                 state.TryGetValue($"{i}.step", out var step))
-                st[ps[i]] = (m, v, (int)MathF.Round(step.Item()));
+            {
+                int t = (int)MathF.Round(step.Item());
+                // Rebuild the device step state so the next step resumes at t+1 with correct bias
+                // correction (matching torch resume). invBc are recomputed from t via the same Pow.
+                float invBc1 = t == 0 ? 0f : 1f / (1f - MathF.Pow(b1, t));
+                float invBc2 = t == 0 ? 0f : 1f / (1f - MathF.Pow(b2, t));
+                st[ps[i]] = (m, v, Tensor.FromArray(new[] { (float)t, invBc1, invBc2 }, 3));
+            }
     }
 }
 
@@ -176,7 +188,7 @@ public sealed class Adam : Optimizer
 public sealed class AdamW : Optimizer
 {
     private readonly float _b1, _b2, _eps, _weightDecay;
-    private readonly Dictionary<Tensor, (Tensor m, Tensor v, int t)> _state = new();
+    private readonly Dictionary<Tensor, (Tensor m, Tensor v, Tensor adv)> _state = new();
 
     public AdamW(IReadOnlyList<Tensor> parameters, float lr = 1e-3f,
         float beta1 = 0.9f, float beta2 = 0.999f, float eps = 1e-8f, float weightDecay = 1e-2f)
@@ -187,28 +199,27 @@ public sealed class AdamW : Optimizer
 
     public override void Step() => StepNoGrad(() =>
     {
+        var rt = TensorRuntime.Instance;
         foreach (var p in Parameters)
         {
             if (p.Grad == null) continue;
 
             if (!_state.TryGetValue(p, out var s))
-                s = (Tensor.Zeros(p.Shape), Tensor.Zeros(p.Shape), 0);
-            int t = s.t + 1;
-            _state[p] = (s.m, s.v, t);
+                s = (Tensor.Zeros(p.Shape), Tensor.Zeros(p.Shape), Adam.NewAdvState());
+            _state[p] = s;
 
-            float invBc1 = 1f / (1f - MathF.Pow(_b1, t));
-            float invBc2 = 1f / (1f - MathF.Pow(_b2, t));
             // Decoupled decay p <- p·(1 − lr·wd) is folded into the fused kernel's factor.
             float decoupled = _weightDecay != 0f ? 1f - LearningRate * _weightDecay : 1f;
-            TensorRuntime.Instance.LaunchAdam(
+            rt.LaunchAdvanceAdam(s.adv.Buffer, _b1, _b2);
+            rt.LaunchAdam(
                 p.Buffer, p.Grad!.Buffer, s.m.Buffer, s.v.Buffer,
-                _b1, 1f - _b1, _b2, 1f - _b2, LearningRate, _eps, invBc1, invBc2,
+                _b1, 1f - _b1, _b2, 1f - _b2, LearningRate, _eps, s.adv.Buffer,
                 coupledWd: 0f, decoupledFactor: decoupled);
         }
     });
 
     public override IEnumerable<(string, Tensor)> StateDict() => Adam.AdamState(_state, Parameters);
-    public override void LoadStateDict(IReadOnlyDictionary<string, Tensor> state) => Adam.LoadAdamState(_state, Parameters, state);
+    public override void LoadStateDict(IReadOnlyDictionary<string, Tensor> state) => Adam.LoadAdamState(_state, Parameters, state, _b1, _b2);
 }
 
 /// <summary>RMSprop (torch.optim.RMSprop) with optional momentum and centering.</summary>

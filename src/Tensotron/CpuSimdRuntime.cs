@@ -239,12 +239,23 @@ internal sealed class CpuSimdRuntime : TensorRuntime
         Launches++;
     }
 
+    public override void LaunchAdvanceAdam(TensorStorage advS, float b1, float b2)
+    {
+        var adv = H(advS);                            // [t, invBc1, invBc2]
+        float t = adv[0] + 1f;
+        adv[0] = t;
+        adv[1] = 1f / (1f - MathF.Pow(b1, t));
+        adv[2] = 1f / (1f - MathF.Pow(b2, t));
+        Launches++;
+    }
+
     public override void LaunchAdam(TensorStorage p, TensorStorage g, TensorStorage m, TensorStorage v,
         float b1, float oneMinusB1, float b2, float oneMinusB2,
-        float lr, float eps, float invBc1, float invBc2, float coupledWd, float decoupledFactor)
+        float lr, float eps, TensorStorage advS, float coupledWd, float decoupledFactor)
     {
+        var adv = H(advS);
         CpuKernels.AdamStep(H(p), H(g), H(m), H(v),
-            b1, oneMinusB1, b2, oneMinusB2, lr, eps, invBc1, invBc2, coupledWd, decoupledFactor);
+            b1, oneMinusB1, b2, oneMinusB2, lr, eps, adv[1], adv[2], coupledWd, decoupledFactor);
         Launches++;
     }
 
