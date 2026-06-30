@@ -518,7 +518,7 @@ internal sealed class IlgpuRuntime : TensorRuntime
     // pool is FED only by explicit Tensor.Dispose() — so default, non-disposing code is byte-for-byte
     // unchanged. Code that bounds its own lifetime (inference loops, or training that frees each
     // step's graph via Tensor.DisposeGraph) recycles buffers instead of churning cudaMalloc/free,
-    // which is the dominant cost once activations get large (see PERFORMANCE_LOG E6).
+    // which is the dominant cost once activations get large.
     private readonly Dictionary<int, Stack<MemoryBuffer1D<float, Stride1D.Dense>>> _floatPool = new();
     private long _pooledBytes;
     private const long MaxPooledBytes = 1L << 30; // cap retained pool memory at ~1 GB

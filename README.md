@@ -51,7 +51,7 @@ One backend runs per process, selected by `Auto` (the default) or the `TENSOTRON
 - **Managed/SIMD CPU** (`simd`) — tensors are `float[]` and every op is a synchronous managed kernel with a `Vector<float>` matmul and no per-op device dispatch. The fast CPU path for small-model inference and training; its matmul has opt-in row parallelism (`TENSOTRON_CPU_THREADS=auto`). At batch-1 it is ~645× faster than the ILGPU scalar CPU accelerator.
 - **`Auto`** — CUDA if a GPU is present, otherwise the managed/SIMD CPU backend.
 
-All three pass the same torch-parity suite. The ILGPU *scalar* CPU accelerator (`cpu`) is a correctness-verification reference only — ~600× slower than the managed path at batch-1 — and prints a loud warning when selected. See [`docs/CPU_SIMD_BACKEND_PROGRESS.md`](docs/CPU_SIMD_BACKEND_PROGRESS.md) for the numbers.
+All three pass the same torch-parity suite. The ILGPU *scalar* CPU accelerator (`cpu`) is a correctness-verification reference only — ~600× slower than the managed path at batch-1 — and prints a loud warning when selected.
 
 ## Installation
 
@@ -258,8 +258,7 @@ serialize), and device-resident MaxPool argmax (no mid-graph host stall). An **o
 (`TensorRuntime.AllowTf32`, off by default) trades a little matmul precision for ~1.5× on the
 tensor cores — note this is a cuBLAS *math mode*, **not** a dtype: storage stays float32, so it
 doesn't violate the float32-only law. See
-[`docs/PERFORMANCE_VS_PYTORCH.md`](docs/PERFORMANCE_VS_PYTORCH.md) for the head-to-head and
-[`docs/PERFORMANCE_LOG.md`](docs/PERFORMANCE_LOG.md) for the per-experiment log.
+[`docs/PERFORMANCE_VS_PYTORCH.md`](docs/PERFORMANCE_VS_PYTORCH.md) for the head-to-head against PyTorch.
 
 **Step capture (fixed-shape training/inference).** The dominant cost of a tiny-model step is host-side
 — a fresh `Tensor`/`GradNode` per op and a full C# autograd-graph rebuild every step (a PPO-scale step

@@ -113,7 +113,7 @@ public sealed partial class Tensor : IDisposable
     /// allocator pool — the deterministic "free the graph" PyTorch does after a non-retained backward.
     /// Leaves (parameters / inputs, Node == null) and this tensor itself are left intact. Call AFTER
     /// backward + optimizer step, when the forward activations are dead; with a bounded buffer pool
-    /// this turns large-activation training from cudaMalloc-bound into reuse (see PERFORMANCE_LOG E6).
+    /// this turns large-activation training from cudaMalloc-bound into reuse.
     /// Caller owns the no-live-view contract, same as <see cref="Dispose"/>.
     /// </summary>
     public void DisposeGraph()
