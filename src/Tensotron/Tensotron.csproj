@@ -6,16 +6,11 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
-  <!-- NuGet package metadata. Versioning is manual until a release pipeline exists. -->
+  <!-- NuGet package identity. Shared metadata (authors, project/repo URL, license, readme,
+       symbols/SourceLink) and MinVer tag-driven versioning live in Directory.Build.props. -->
   <PropertyGroup>
     <PackageId>Tensotron</PackageId>
-    <Version>0.1.0-alpha</Version>
-    <Authors>Mattias Fagerlund</Authors>
     <Description>A PyTorch-faithful, float32 tensor and autograd library for .NET, GPU-accelerated with ILGPU. Correctness-first: if it doesn't behave like PyTorch, it's a bug.</Description>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageReadmeFile>README.md</PackageReadmeFile>
-    <RepositoryUrl>https://github.com/mfagerlund/Tensotron</RepositoryUrl>
-    <RepositoryType>git</RepositoryType>
     <PackageTags>tensor;autograd;deep-learning;machine-learning;ilgpu;gpu;pytorch;neural-network</PackageTags>
   </PropertyGroup>
 

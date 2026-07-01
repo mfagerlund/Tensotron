@@ -1,5 +1,9 @@
 # Tensotron
 
+[![CI](https://github.com/mfagerlund/Tensotron/actions/workflows/ci.yml/badge.svg)](https://github.com/mfagerlund/Tensotron/actions/workflows/ci.yml)
+[![NuGet](https://img.shields.io/nuget/vpre/Tensotron.svg)](https://www.nuget.org/packages/Tensotron)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A **PyTorch-faithful** tensor and autograd library for .NET, **float32** throughout. It runs on **CUDA** (via ILGPU + cuBLAS) when a GPU is present, or a hand-written **managed/SIMD CPU** backend when one isn't — same op surface, same torch-parity tests either way.
 
 <p align="center">
@@ -55,12 +59,15 @@ All three pass the same torch-parity suite. The ILGPU *scalar* CPU accelerator (
 
 ## Installation
 
-Tensotron is **not yet published to NuGet.** Consume it from source:
+Tensotron is on NuGet (prerelease):
 
-- **Project reference** (recommended): clone the repo and reference the library project —
-  `<ProjectReference Include="path/to/Tensotron/src/Tensotron/Tensotron.csproj" />`.
-- **Local package**: `dotnet pack src/Tensotron/Tensotron.csproj -c Release` produces
-  `Tensotron.0.1.0-alpha.nupkg`, which you can add to a local NuGet feed.
+```bash
+dotnet add package Tensotron --prerelease
+```
+
+Or consume it from source — clone the repo and add a
+`<ProjectReference Include="path/to/Tensotron/src/Tensotron/Tensotron.csproj" />` (what
+[Bascule](https://github.com/mfagerlund/Bascule) does, via a submodule).
 
 Requires .NET 8. A GPU is optional — without CUDA it runs on the managed CPU backend.
 

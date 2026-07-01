@@ -2,6 +2,7 @@ name: Publish Tensotron to NuGet
 
 # Trusted publishing (OIDC → short-lived key) — no stored API key.
 # nuget.org policy: Repository Owner = mfagerlund, Repository = Tensotron, Workflow File = publish.yml.
+# Publish is gated on the test job so a broken tag can't ship an immutable package.
 on:
   push:
     tags:
@@ -9,15 +10,32 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '8.0.x'
+      - name: Test (managed SIMD CPU backend)
+        env:
+          TENSOTRON_BACKEND: simd
+        run: dotnet test Tensotron.sln --configuration Release --filter "FullyQualifiedName!~TraceReplay&FullyQualifiedName!~AllocatorPool&FullyQualifiedName!~Device&FullyQualifiedName!~TiledMatMul&FullyQualifiedName!~BatchedCuBlas&Category!=Showcase"
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       id-token: write   # enable GitHub OIDC token issuance for trusted publishing
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # MinVer derives the version from git history + tags
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '8.0.x'
 

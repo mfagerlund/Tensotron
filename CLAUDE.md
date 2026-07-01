@@ -51,7 +51,7 @@ Every op ships with a **golden-fixture parity test or it doesn't land** — asse
 
 ## Layout
 
-- `src/Tensotron/` — `Shape`, `Tensor`, `TensorOps.*` (op surface), `Kernels`, `TensorRuntime`, `Ops*` (struct-generic op types), plus `Module`/`Conv`/`Pool`/`Norm`/`Optimizers`/`LrSchedulers`/`Init`/`DataLoader`/`Serialization`. Packable as NuGet package `Tensotron` (uses `PACKAGE.md` as the packed readme, not `README.md`) — **not yet published to nuget.org**; consumers use a `ProjectReference` or a locally-packed `.nupkg`.
+- `src/Tensotron/` — `Shape`, `Tensor`, `TensorOps.*` (op surface), `Kernels`, `TensorRuntime`, `Ops*` (struct-generic op types), plus `Module`/`Conv`/`Pool`/`Norm`/`Optimizers`/`LrSchedulers`/`Init`/`DataLoader`/`Serialization`. Published to nuget.org as `Tensotron` (uses `PACKAGE.md` as the packed readme, not `README.md`); versioned by MinVer from `v*` git tags, shared metadata in `Directory.Build.props`. Consumers `dotnet add package Tensotron --prerelease`, or use a `ProjectReference` for engine co-development (what Bascule does via a submodule).
 - `tests/Tensotron.Tests/` — torch-parity tests + `Fixtures.cs` loader; `Fixtures/*.json` committed. "Tensotron works."
 - `showcase/Tensotron.Showcase/` — end-to-end tasks (continuous-PPO pole-cart, MNIST CNN) asserting real learning, emitting SVG replays. "Tensotron can be used for these things."
 - `examples/Tensotron.Examples/` — runnable console app (`dotnet run --project examples/Tensotron.Examples [xor|spiral|regression]`) with minimal from-scratch training loops for newcomers; spiral/regression write an SVG. Not a test project. `Plot.cs` is a local SVG helper, not part of the library.
