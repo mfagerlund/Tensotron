@@ -21,7 +21,7 @@
     <PackageReference Include="xunit" Version="2.9.2" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
     <!-- Real Skipped status for GPU-gated showcase tests (xUnit v2 has no dynamic Assert.Skip). -->
-    <PackageReference Include="Xunit.SkippableFact" Version="1.5.23" />
+    <PackageReference Include="Xunit.SkippableFact" Version="1.5.61" />
   </ItemGroup>
 
   <ItemGroup>
