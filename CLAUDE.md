@@ -56,3 +56,9 @@ Every op ships with a **golden-fixture parity test or it doesn't land** — asse
 - `showcase/Tensotron.Showcase/` — end-to-end tasks (continuous-PPO pole-cart, MNIST CNN) asserting real learning, emitting SVG replays. "Tensotron can be used for these things."
 - `examples/Tensotron.Examples/` — runnable console app (`dotnet run --project examples/Tensotron.Examples [xor|spiral|regression]`) with minimal from-scratch training loops for newcomers; spiral/regression write an SVG. Not a test project. `Plot.cs` is a local SVG helper, not part of the library.
 - `tools/fixtures/gen.py` — torch fixture generator (the only torch dependency).
+
+## Project card
+
+`project-card/` holds this project's one-liner, tags and image for the cross-project index.
+When the purpose or the look of the project changes materially, regenerate it with
+`/project-index Tensotron`.
