@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to coding agents working in this repository.
 
 Tensotron is a PyTorch-faithful, **float32-only** GPU tensor + autograd library for .NET 8, built on **ILGPU**. See `README.md` for the full design rationale and current backend status; this file is the operational distillation.
 
